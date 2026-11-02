@@ -4,8 +4,13 @@ Mise à jour glissante (*rolling update*) d'un cluster **Proxmox VE** —
 `apt full-upgrade` + reboot, **un nœud à la fois**, sans fencing inattendu,
 avec gestion du HA, de Ceph (si présent) et rééquilibrage final du cluster.
 
-Un seul fichier : `proxmox_rolling_update.py` (Python 3, dépendances :
-`proxmoxer`, `paramiko`).
+Deux scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
+
+- `proxmox_rolling_update.py` — mise à jour des nœuds PVE (ce README) ;
+- `proxmox_ceph_rolling_update.py` — mise à jour glissante de Ceph :
+  mineure par défaut, `--major RELEASE` (ex. tentacle 20.2) et
+  `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
+  re-détectées et sautées) — voir son docstring.
 
 ---
 
@@ -20,8 +25,9 @@ Un seul fichier : `proxmox_rolling_update.py` (Python 3, dépendances :
 7. [Sécurités intégrées](#sécurités-intégrées)
 8. [Reprise après interruption](#reprise-après-interruption)
 9. [Ceph : fenêtre de maintenance et gates](#ceph--fenêtre-de-maintenance-et-gates)
-10. [Variables d'environnement](#variables-denvironnement)
-11. [Limites connues](#limites-connues)
+10. [Estimations du dry-run et statistiques de durées](#estimations-du-dry-run-et-statistiques-de-durées)
+11. [Variables d'environnement](#variables-denvironnement)
+12. [Limites connues](#limites-connues)
 
 ---
 
@@ -150,7 +156,8 @@ l'écart optimisé. CPU surveillé (≤ 80 %). Skip si Ceph n'est pas
 HEALTH_OK (sauf `PVE_CEPH_ALLOW_WARN=1`).
 
 **Bilan final** : tables d'occupation avant/après, synthèse des
-migrations et upgrades.
+migrations et upgrades. En dry-run s'y ajoute l'estimation de durée
+(voir [Estimations du dry-run](#estimations-du-dry-run-et-statistiques-de-durées)).
 
 ## Sécurités intégrées
 
@@ -278,6 +285,56 @@ nœud client ne fait tomber aucun daemon Ceph. Points d'attention :
 - un montage CephFS local (LXC) qui ne remonte pas après un reboot est
   attrapé par le check « services en échec ».
 
+## Estimations du dry-run et statistiques de durées
+
+En fin de dry-run, un **bilan d'estimation** affiche la durée totale
+approximative du run (±30 %), son détail (migrations, apt/upgrade/reboot,
+fenêtres de stabilité CRM) et les fenêtres de risque des anti-affinités
+« keep separate » (pics de pression RAM, durée du risque).
+
+### Des estimations qui s'affinent toutes seules
+
+Chaque run `--execute` **mesure** ses durées réelles et les accumule dans
+`.proxmox-rolling-update.stats` (JSON, à côté du script, écriture
+atomique) :
+
+| Catégorie | Mesuré |
+|---|---|
+| `apt_update_s` | `apt update` + simulation apt, par nœud |
+| `apt_upgrade_s` | `apt full-upgrade`, par nœud |
+| `reboot_s` | reboot → retour en ligne → quorum → post-checks |
+| `migrate` | live migrations QEMU sur stockage partagé (RAM + durée) |
+
+Les LXC (migration en mode *restart* : coupure, pas de transfert RAM en
+continu) et les VMs à disques locaux (copie des disques, non modélisée)
+sont **exclues** des échantillons de migration pour ne pas fausser le
+modèle.
+
+Au run suivant, les moyennes observées remplacent les défauts :
+
+- **apt / upgrade / reboot** : moyenne arithmétique des durées mesurées ;
+- **migrations** : régression des moindres carrés sur le modèle
+  `durée = overhead + RAM / débit` (le modèle exact du bilan), avec
+  garde-fous (au moins 4 échantillons, débit borné, overhead non
+  négatif) — sinon retour aux défauts ;
+- **fenêtre glissante** : seuls les `PVE_STATS_MAX_SAMPLES` derniers
+  échantillons par catégorie sont conservés (défaut 20) — un cluster qui
+  évolue ne reste pas esclave de vieilles mesures ;
+- **priorité** : variable d'environnement `PVE_EST_*` > statistiques
+  observées > défauts du script — une variable d'env a toujours le
+  dernier mot.
+
+Détails d'implémentation :
+
+- le fichier est écrit dans le `finally` du run : **même un run partiel**
+  (erreur en cours de route, sortie de maintenance en filet de sécurité)
+  contribue ses échantillons ;
+- une écriture impossible (permissions, disque plein) n'échoue **jamais**
+  le run ;
+- un fichier corrompu est ignoré silencieusement (retour aux défauts) ;
+- le bilan affiche la provenance de chaque hypothèse : `stats (n=X)`
+  (moyenne observée), `défaut` ou `env`.
+
 ## Variables d'environnement
 
 | Variable | Défaut | Rôle |
@@ -297,6 +354,13 @@ nœud client ne fait tomber aucun daemon Ceph. Points d'attention :
 | `PVE_CEPH_ALLOW_AUTH_INSECURE` | `0` | Tolérer les avis cephx AUTH_INSECURE_* (CVE-2025-30156, Ceph ≥ 19.2.6) |
 | `PVE_CEPH_POSTBOOT_TIMEOUT` | `300` | Attente de convergence après reboot (s) |
 | `PVE_CEPH_READY_TIMEOUT` | `900` | Attente HEALTH_OK avant évacuation/reboot (s) |
+| `PVE_EST_MIGRATE_SPEED_MBPS` | `250` | Débit effectif d'une migration live (Mo/s), bilan dry-run |
+| `PVE_EST_MIGRATE_OVERHEAD_S` | `60` | Overhead fixe par migration (s), bilan dry-run |
+| `PVE_EST_APT_MIN` | `2` | apt update + simulation (min/nœud), bilan dry-run |
+| `PVE_EST_UPGRADE_MIN` | `6` | apt full-upgrade (min/nœud), bilan dry-run |
+| `PVE_EST_REBOOT_MIN` | `9` | reboot + retour + post-checks (min/nœud), bilan dry-run |
+| `PVE_STATS_FILE` | auto | Fichier de statistiques de durées (défaut : `.proxmox-rolling-update.stats` à côté du script) |
+| `PVE_STATS_MAX_SAMPLES` | `20` | Fenêtre glissante d'échantillons par catégorie |
 | `PVE_LOG_FILE` | vide | Fichier de log parallèle (sans ANSI) |
 | `PVE_STATE_FILE` | auto | Emplacement du fichier d'état JSON |
 
