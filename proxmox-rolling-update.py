@@ -149,6 +149,137 @@ EST_UPGRADE_MIN = float(_env("PVE_EST_UPGRADE_MIN", "6"))
 EST_REBOOT_MIN = float(_env("PVE_EST_REBOOT_MIN", "9"))
                                 # reboot + quorum + post-checks + fenêtre
                                 # de stabilité CRM 60s, par nœud maintenu
+
+# --- STATISTIQUES DE DURÉES RÉELLES (.proxmox-rolling-update.stats) -----
+# Chaque run --execute MESURE les durées réelles de ses opérations
+# (apt update + simulation, apt full-upgrade, séquence reboot→quorum→
+# post-checks, live migrations QEMU) et les accumule dans un fichier
+# JSON. Au démarrage suivant, les moyennes OBSERVÉES remplacent les
+# DÉFAUTS des PVE_EST_* ci-dessus quand des échantillons existent :
+# les estimations du dry-run collent de plus en plus à VOTRE cluster
+# au fil des runs. Précédence : variable d'env (shell ou fichier env)
+# > statistiques observées > défaut.
+STATS_FILE = _env("PVE_STATS_FILE",
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".proxmox-rolling-update.stats"))
+STATS_MAX_SAMPLES = int(_env("PVE_STATS_MAX_SAMPLES", "20"))
+                                # fenêtre glissante : les N derniers
+                                # échantillons par catégorie (le cluster
+#                               # évolue, les vieilles mesures dérivent)
+
+# provenance des EST_* pour le bilan final : {clé: "stats (n=5)"|"défaut"}
+EST_PROV: Dict[str, str] = {}
+
+
+def load_stats() -> Optional[Dict]:
+    """Fichier de statistiques s'il existe et est valide, sinon None.
+    Lecture tolérante : fichier corrompu/incompatible => None (on
+    repart sur les défauts, sans faire échouer le run)."""
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    samples = data.get("samples")
+    if not isinstance(samples, dict):
+        return None
+    return data
+
+
+def _stats_mean(values: List[float]) -> Optional[float]:
+    """Moyenne arithmétique des valeurs > 0 (None si aucun échantillon)."""
+    vals = [float(v) for v in values if v and float(v) > 0]
+    return (sum(vals) / len(vals)) if vals else None
+
+
+def _stats_migrate_fit(samples: List[Dict]) -> Optional[Dict]:
+    """Débit EFFECTIF et overhead des migrations depuis les échantillons
+    (ram, dur) : droite des moindres carrés  dur = overhead + ram/speed.
+    Le modèle du dry-run (dur = ram/EST_MIGRATE_SPEED + EST_MIGRATE_
+    OVERHEAD_S) est EXACTEMENT cette droite : les échantillons des VMs
+    stopped (ram=0) ancrent l'intercept (overhead), les grosses VMs
+    la pente (débit). Garde-fous : ≥ 4 échantillons, rams dispersées,
+    pente positive, débit plausible [5, 5000] Mo/s, overhead borné —
+    sinon None (pas assez de signal : on garde les défauts)."""
+    pts = [(float(s.get("ram") or 0), float(s.get("dur") or 0))
+           for s in samples if s.get("dur") and float(s.get("dur")) > 0]
+    n = len(pts)
+    if n < 4:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    if len(set(xs)) < 2:
+        return None                      # rams identiques : pas de pente
+    mx, my = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mx) * (y - my) for x, y in pts)
+    var = sum((x - mx) ** 2 for x in xs)
+    if var <= 0 or cov <= 0:
+        return None
+    speed = var / cov                    # octets/s (1/pente)
+    overhead = my - (cov / var) * mx     # intercept (secondes)
+    speed_mbps = speed / (1024 ** 2)
+    if not (5 <= speed_mbps <= 5000):
+        return None
+    overhead = int(round(max(0.0, min(overhead, min(ys), 900))))
+    return {"speed_mbps": int(round(speed_mbps)), "overhead_s": overhead}
+
+
+def stats_derive(data: Optional[Dict]) -> Dict:
+    """Paramètres OBSERVÉS (moyennes) depuis le fichier de stats.
+    Retourne {clé: (valeur, n)} — une catégorie sans assez d'échantillons
+    est ABSENTE : l'appelant garde alors sa valeur par défaut."""
+    out: Dict = {}
+    if not data:
+        return out
+    samples = data.get("samples") or {}
+
+    def _put(key: str, src: str, conv):
+        m = _stats_mean(samples.get(src) or [])
+        if m is not None:
+            out[key] = (conv(m), len(samples.get(src) or []))
+
+    _put("apt_min", "apt_update_s", lambda s: round(s / 60, 1))
+    _put("upgrade_min", "apt_upgrade_s", lambda s: round(s / 60, 1))
+    _put("reboot_min", "reboot_s", lambda s: round(s / 60, 1))
+    mig = [s for s in (samples.get("migrate") or [])
+           if isinstance(s, dict)]
+    fit = _stats_migrate_fit(mig)
+    if fit:
+        out["speed_mbps"] = (fit["speed_mbps"], len(mig))
+        out["overhead_s"] = (fit["overhead_s"], len(mig))
+    return out
+
+
+def save_stats(new_samples: Dict[str, list]) -> int:
+    """Fusionne les échantillons de CE run dans le fichier de stats
+    (fenêtre glissante STATS_MAX_SAMPLES par catégorie, écriture
+    atomique). Retourne le nombre d'échantillons ajoutés ; 0 (et
+    fichier intact) si rien à écrire ou erreur d'écriture — les
+    statistiques ne font JAMAIS échouer un run."""
+    added = sum(len(v) for v in new_samples.values() if v)
+    if added <= 0:
+        return 0
+    data = load_stats() or {"version": 1, "samples": {}}
+    samples = data.setdefault("samples", {})
+    for key, vals in new_samples.items():
+        if not vals:
+            continue
+        cur = [v for v in (samples.get(key) or []) + list(vals)
+               if v is not None]
+        samples[key] = cur[-STATS_MAX_SAMPLES:]
+    data["updated"] = datetime.now().isoformat(timespec="seconds")
+    try:
+        tmp = STATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp, STATS_FILE)
+    except OSError:
+        return 0
+    return added
+
+
 REBOOT_CHECK_INTERVAL = 10
 FRESH_BOOT_UPTIME = 300         # uptime (s) sous lequel un nœud est considéré
                                 # fraîchement booté (preuve du reboot effectif)
@@ -3425,6 +3556,15 @@ class Updater:
         # un nœud de leur règle pendant le rééquilibrage final (gel CRM) :
         # pour le rapport final — dégel cohérent, CRM sans correction.
         self.off_rule_returned: Set[int] = set()
+        # Échantillons de durées RÉELLES mesurés pendant CE run (mode
+        # --execute uniquement) : alimentés par les timers de
+        # l'apt/reboot/migrations, fusionnés dans .proxmox-rolling-
+        # update.stats par save_stats() dans le finally de run() —
+        # même un run partiel (erreur en cours de route) contribue.
+        self.stats_new: Dict[str, list] = {"apt_update_s": [],
+                                          "apt_upgrade_s": [],
+                                          "reboot_s": [],
+                                          "migrate": []}
         # ---- BILAN DRY-RUN : horloge simulée + journal des migrations —
         # durée approximative du run, volume transféré, fenêtres de
         # cohabitation des anti-affinités « keep separate » (évaluation
@@ -3592,6 +3732,18 @@ class Updater:
                                  f"{e}")
 
     # ---------- helpers ----------
+    def _vm_on_local(self, node: str, vm) -> bool:
+        """True si la VM est (ou peut être) sur stockage LOCAL : l'échantillon
+        de migration serait biaisé (copie des disques, non modélisé), on
+        l'exclut des statistiques. Indéterminé (None, storages illisibles)
+        ou erreur : CONSERVATEUR → True (exclu) — mieux vaut un échantillon
+        de moins qu'une régression faussée."""
+        try:
+            return self.client.vm_on_local_storage(
+                node, vm.vmid, vm.vmtype) is not False
+        except Exception:
+            return True
+
     def _apply_migrations(self, plans: List[Dict], state: ClusterState,
                           migrate: bool = True, ha_live: bool = False):
         """Exécute (ou simule) les migrations du plan et met à jour l'état.
@@ -3615,6 +3767,7 @@ class Updater:
                              if v.vmid == p["vm"].vmid), p["vm"])
             else:
                 if not self.dry and migrate:
+                    _t_mig = time.time()
                     self.client.migrate_vm(p["from"], real.vmid, tgt, real.vmtype)
                     self.touched = True
                     # diagnostic post-migration : la VM a-t-elle survécu ?
@@ -3627,6 +3780,18 @@ class Updater:
                             f"{k} {real.vmid} injoignable après migration "
                             f"vers {tgt} — arrêt avant d'aggraver la "
                             f"situation (fichier d'état conservé).")
+                    # statistiques : une LIVE migration QEMU sur stockage
+                    # PARTICIPATIF est un échantillon exploitable du
+                    # modèle dur = ram/EST_MIGRATE_SPEED + overhead. Les
+                    # LXC (mode restart : coupure, pas de transfert
+                    # RAM en continu) et les disques LOCAUX (copie de
+                    # disques, modèle différent) sont EXCLUS pour ne pas
+                    # biaiser la régression.
+                    if (real.vmtype != "lxc" and real.status == "running"
+                            and not self._vm_on_local(tgt, real)):
+                        self.stats_new["migrate"].append(
+                            {"ram": vm_load(real),
+                             "dur": round(time.time() - _t_mig, 1)})
                 state.nodes[p["from"]].vms.remove(real)
                 state.nodes[tgt].vms.append(real)
                 # suivi des occupations RAM pour l'affichage/le placement
@@ -3802,8 +3967,16 @@ class Updater:
         # des paquets à mettre à jour et si le noyau est concerné.
         # Identique en dry-run et en exécution : c'est ce qui permet à la
         # simulation de reposer sur des données réelles.
+        # statistiques : durée réelle de l'évaluation (apt update +
+        # simulation apt), mesurée dans les DEUX modes mais enregistrée
+        # uniquement en exécution réelle (identique dans les deux cas,
+        # mais seul --execute doit alimenter les moyennes).
+        _t_eval = time.time()
         self.client.apt_update(node)
         n_up, kernel_up, dl_b, inst_b = self.client.apt_upgrade_pending(node)
+        if not self.dry:
+            self.stats_new["apt_update_s"].append(
+                round(time.time() - _t_eval, 1))
 
         # --- DIAGNOSTIC ESPACE DISQUE (chaque nœud, avec l'apt update) :
         # lecture pure (df + simulation apt), jouée aussi en dry-run.
@@ -4189,12 +4362,20 @@ class Updater:
             banner(self.log, f"PHASE 2 — "
                    + ("REBOOT EN ATTENTE" if reboot_only else "UPGRADE SYSTÈME")
                    + f" DE {node}", ColorFormatter.CYAN)
+            # per-nœud : le marqueur de début de reboot est remis à
+            # zéro (un résidu du nœud précédent ne doit pas créer un
+            # échantillon 'reboot_s' fantôme sur un nœud sans reboot).
+            self._reboot_t0 = 0.0
             if reboot_only:
                 self.log.info(f"{node}: apt full-upgrade Sauté — aucun "
                               f"paquet à mettre à jour, seul le reboot du "
                               f"noyau en attente est traité")
             else:
+                _t_up = time.time()
                 self.client.apt_upgrade(node)
+                if not self.dry:
+                    self.stats_new["apt_upgrade_s"].append(
+                        round(time.time() - _t_up, 1))
             if self.client.reboot_required(node):
                 # le nœud va tomber : re-contrôle Ceph (l'upgrade a pu
                 # durer longtemps, un recovery a pu démarrer entre-temps)
@@ -4210,6 +4391,7 @@ class Updater:
                     self.ceph_flags.update(newly)
                     self._state_write()
                 # 2e) reboot + attente du retour
+                self._reboot_t0 = time.time()
                 self.client.reboot_node(node)
                 self.client.wait_node_back(node)
                 # 2e-bis) fenêtre de reboot TERMINÉE : le nœud est de
@@ -4244,6 +4426,13 @@ class Updater:
             # 2f) vérifications post-reboot
             if not self.client.post_boot_checks(node):
                 raise RuntimeError(f"Les vérifications post-reboot de {node} ont échoué.")
+            # statistiques : séquence reboot complète (reboot → retour
+            # en ligne → quorum → post-checks), uniquement si un reboot
+            # a VRAIMENT eu lieu sur ce nœud pendant ce run.
+            if not self.dry and getattr(self, "_reboot_t0", 0):
+                self.stats_new["reboot_s"].append(
+                    round(time.time() - self._reboot_t0, 1))
+                self._reboot_t0 = 0
 
         finally:
             # INTERRUPTION UTILISATEUR (Ctrl-C) pendant le traitement de
@@ -4720,12 +4909,22 @@ class Updater:
                 "  hypothèses (ajustables par env) : migration live ~"
                 + str(EST_MIGRATE_SPEED // (1024 ** 2))
                 + f" Mo/s + {EST_MIGRATE_OVERHEAD_S}s par migration "
+                  f"[{EST_PROV.get('débit migration', 'défaut')} / "
+                  f"{EST_PROV.get('overhead migration', 'défaut')}] "
                   "(PVE_EST_MIGRATE_SPEED_MBPS, PVE_EST_MIGRATE_OVERHEAD_S)")
             self.log.info(
                 f"  hypothèses (ajustables par env) : apt {EST_APT_MIN:.0f} min "
                 f"+ upgrade {EST_UPGRADE_MIN:.0f} min + reboot "
                 f"{EST_REBOOT_MIN:.0f} min par nœud maintenu "
+                f"[{EST_PROV.get('apt update+simulation', 'défaut')} / "
+                f"{EST_PROV.get('apt full-upgrade', 'défaut')} / "
+                f"{EST_PROV.get('reboot+quorum+post-checks', 'défaut')}] "
                 "(PVE_EST_APT_MIN, PVE_EST_UPGRADE_MIN, PVE_EST_REBOOT_MIN)")
+            self.log.info(
+                "  NB : les valeurs marquées « stats (n=X) » sont des "
+                "moyennes OBSERVÉES sur vos runs --execute précédents "
+                f"({STATS_FILE}) ; « défaut » = constantes du script, "
+                "à affiner au fil des runs.")
         # NB stockage LOCAL : seulement si le CAS a eu lieu pendant ce
         # dry-run (au moins un guest migré avec disque sur stockage non
         # partagé — détection réelle via la config du guest) ;
@@ -5194,6 +5393,22 @@ class Updater:
                         self._state_write()
                     except Exception as ee:
                         self.log.error(f"Impossible de sortir {n} du mode maintenance : {ee}")
+            # STATISTIQUES : fusion des durées réelles mesurées pendant ce
+            # run dans .proxmox-rolling-update.stats — dans le finally,
+            # donc MÊME un run partiel (erreur en cours de route, sortie
+            # de maintenance en filet de sécurité) contribue ses
+            # échantillons. Une écriture impossible n'échoue jamais le run.
+            if not self.dry:
+                try:
+                    added = save_stats(self.stats_new)
+                except Exception as ee:
+                    added = 0
+                    self.log.warning(f"Statistiques non enregistrées : {ee}")
+                if added:
+                    self.log.info(
+                        f"Statistiques : {added} échantillon(s) de durée(s) "
+                        f"réelle(s) ajouté(s) à {STATS_FILE} — les "
+                        f"estimations des prochains dry-run s'affineront.")
 
 
 # ---------------------------------------------------------------------------
@@ -5270,19 +5485,74 @@ def main():
     global WITH_LOCAL_DISKS
     global EST_MIGRATE_SPEED, EST_MIGRATE_OVERHEAD_S
     global EST_APT_MIN, EST_UPGRADE_MIN, EST_REBOOT_MIN
+    global STATS_FILE, STATS_MAX_SAMPLES
     API_HOST = _env("PVE_API_HOST", API_HOST)
     # PVE_API_HOSTS et PVE_EST_* : relus APRÈS le fichier d'env comme les
     # autres — sinon une valeur posée UNIQUEMENT dans ce fichier serait
     # silencieusement ignorée (constante déjà évaluée à l'import ; la
     # précédence reste : shell env > fichier env > défaut).
     API_HOSTS = [h.strip() for h in _env("PVE_API_HOSTS", "").split(",") if h.strip()]
-    EST_MIGRATE_SPEED = int(_env("PVE_EST_MIGRATE_SPEED_MBPS",
-                                 str(EST_MIGRATE_SPEED // 1024 ** 2))) * 1024 ** 2
-    EST_MIGRATE_OVERHEAD_S = int(_env("PVE_EST_MIGRATE_OVERHEAD_S",
-                                      str(EST_MIGRATE_OVERHEAD_S)))
-    EST_APT_MIN = float(_env("PVE_EST_APT_MIN", str(EST_APT_MIN)))
-    EST_UPGRADE_MIN = float(_env("PVE_EST_UPGRADE_MIN", str(EST_UPGRADE_MIN)))
-    EST_REBOOT_MIN = float(_env("PVE_EST_REBOOT_MIN", str(EST_REBOOT_MIN)))
+    # --- STATISTIQUES DE DURÉES : les moyennes OBSERVÉES (.proxmox-
+    # rolling-update.stats) servent de DÉFAUTS dans _env() ci-dessous.
+    # La précédence de chaque PVE_EST_* devient donc :
+    #   shell env > fichier env > statistiques observées > défaut du code.
+    # _env() lit os.environ (déjà chargé du fichier env à ce stade) :
+    # une variable D'ENV a toujours le dernier mot sur les stats.
+    STATS_FILE = _env("PVE_STATS_FILE", STATS_FILE)
+    STATS_MAX_SAMPLES = int(_env("PVE_STATS_MAX_SAMPLES",
+                                 str(STATS_MAX_SAMPLES)))
+    derived = stats_derive(load_stats())
+    EST_PROV.clear()
+    EST_MIGRATE_SPEED = int(_env(
+        "PVE_EST_MIGRATE_SPEED_MBPS",
+        str(derived.get("speed_mbps",
+                        (EST_MIGRATE_SPEED // 1024 ** 2, 0))[0]))) * 1024 ** 2
+    EST_MIGRATE_OVERHEAD_S = int(_env(
+        "PVE_EST_MIGRATE_OVERHEAD_S",
+        str(derived.get("overhead_s", (EST_MIGRATE_OVERHEAD_S, 0))[0])))
+    EST_APT_MIN = float(_env(
+        "PVE_EST_APT_MIN", str(derived.get("apt_min", (EST_APT_MIN, 0))[0])))
+    EST_UPGRADE_MIN = float(_env(
+        "PVE_EST_UPGRADE_MIN", str(derived.get("upgrade_min",
+                                               (EST_UPGRADE_MIN, 0))[0])))
+    EST_REBOOT_MIN = float(_env(
+        "PVE_EST_REBOOT_MIN", str(derived.get("reboot_min",
+                                              (EST_REBOOT_MIN, 0))[0])))
+    # provenance de chaque paramètre (pour le bilan final) : env si la
+    # variable est POSÉE, statistiques si des échantillons existent,
+    # sinon défaut du code.
+    for env_name, key, label in (
+            ("PVE_EST_MIGRATE_SPEED_MBPS", "speed_mbps", "débit migration"),
+            ("PVE_EST_MIGRATE_OVERHEAD_S", "overhead_s", "overhead migration"),
+            ("PVE_EST_APT_MIN", "apt_min", "apt update+simulation"),
+            ("PVE_EST_UPGRADE_MIN", "upgrade_min", "apt full-upgrade"),
+            ("PVE_EST_REBOOT_MIN", "reboot_min", "reboot+quorum+post-checks")):
+        if os.environ.get(env_name):
+            EST_PROV[label] = "env"
+        elif key in derived:
+            EST_PROV[label] = f"stats (n={derived[key][1]})"
+        else:
+            EST_PROV[label] = "défaut"
+    if derived:
+        logger.info(
+            "Statistiques de durées : " + " ; ".join(
+                f"{lbl} = {val}{'' if prov == 'env' else f' [{prov}]'}"
+                for lbl, val, prov in (
+                    ("débit migr.", f"{EST_MIGRATE_SPEED // 1024 ** 2} Mo/s",
+                     EST_PROV["débit migration"]),
+                    ("overhead migr.", f"{EST_MIGRATE_OVERHEAD_S}s",
+                     EST_PROV["overhead migration"]),
+                    ("apt éval.", f"{EST_APT_MIN:.1f}min",
+                     EST_PROV["apt update+simulation"]),
+                    ("upgrade", f"{EST_UPGRADE_MIN:.1f}min",
+                     EST_PROV["apt full-upgrade"]),
+                    ("reboot", f"{EST_REBOOT_MIN:.1f}min",
+                     EST_PROV["reboot+quorum+post-checks"]))))
+    else:
+        logger.info(
+            "Statistiques de durées : aucune pour l'instant — valeurs par "
+            "défaut ; chaque run --execute mesurera ses durées réelles "
+            f"et les accumulera dans {STATS_FILE}.")
     API_USER = _env("PVE_API_USER", API_USER)
     API_TOKEN_NAME = _env("PVE_API_TOKEN_NAME", API_TOKEN_NAME)
     API_TOKEN_VALUE = _env("PVE_API_TOKEN_VALUE", API_TOKEN_VALUE)
