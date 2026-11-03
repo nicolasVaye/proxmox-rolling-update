@@ -8,9 +8,14 @@ Deux scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
 
 - `proxmox_rolling_update.py` — mise à jour des nœuds PVE (ce README) ;
 - `proxmox_ceph_rolling_update.py` — mise à jour glissante de Ceph :
-  mineure par défaut, `--major RELEASE` (ex. tentacle 20.2) et
+  mineure par défaut, `--major RELEASE` (ex. tentacle 20.2 ; montée
+  d'exactement une release — descente et saut refusés, prérequis
+  pve-manager/ceph vérifiés, `require-osd-release` précédé de la
+  preuve que TOUTES les OSDs sont sur la nouvelle release) et
   `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
-  re-détectées et sautées) — voir son docstring.
+  re-détectées et sautées). Connexion SSH persistante par nœud
+  (`PVE_SSH_RETRIES`), stderr capturé dans le fichier de log, bilan
+  signalant explicitement les runs interrompus — voir son docstring.
 
 ---
 
@@ -137,6 +142,13 @@ simple rapport.
   affinités respectées), puis migrations réelles, en respectant les marges
   de sécurité RAM (AUTO : `min(max(10 % × RAM, 8 G), 48 G, 30 % × RAM)`)
   et 80 % de CPU.
+- **VMs arrêtées : laissées sur place** (aucune migration) — une VM éteinte
+  ne court aucun risque pendant l'upgrade et le reboot ; sa ressource HA
+  reste détachée puis réactivée dans son état d'origine (`stopped`), sans
+  churn. Garde-fou : une VM arrêtée avec `onboot: 1` (ou de config
+  illisible) reste **migrée** comme avant — laissée sur place, elle
+  partirait au boot du nœud (plus gérée par le HA en `ignored`), puis le
+  CRM l'éteindrait à la réactivation de sa ressource.
 - `apt full-upgrade` en streaming dans les logs ; si noyau nouveau :
   re-contrôle Ceph, **flags de maintenance Ceph** (si Ceph), reboot,
   attente du retour (uptime réinitialisé, max 15 min).
@@ -349,6 +361,7 @@ Détails d'implémentation :
 | `PVE_SSH_KEY` | `/etc/proxmox-updater/id_ed25519` | Clé privée SSH |
 | `PVE_SSH_PASSPHRASE` | vide | Passphrase de la clé (vide = sans) |
 | `PVE_SSH_PORT` | `22` | Port SSH |
+| `PVE_SSH_RETRIES` | `3` | Retentatives SSH par commande (délais 15/30/45 s) ; connexion persistante par nœud |
 | `PVE_WITH_LOCAL_DISKS` | `true` | Migrer les disques locaux des VMs |
 | `PVE_CEPH_ALLOW_WARN` | `0` | Tolérer HEALTH_WARN aux gates Ceph (risqué) |
 | `PVE_CEPH_ALLOW_AUTH_INSECURE` | `0` | Tolérer les avis cephx AUTH_INSECURE_* (CVE-2025-30156, Ceph ≥ 19.2.6) |
@@ -362,7 +375,7 @@ Détails d'implémentation :
 | `PVE_STATS_FILE` | auto | Fichier de statistiques de durées (défaut : `.proxmox-rolling-update.stats` à côté du script) |
 | `PVE_STATS_MAX_SAMPLES` | `20` | Fenêtre glissante d'échantillons par catégorie |
 | `PVE_MIGRATE_TIMEOUT` | `600` | Plancher du timeout d'attente d'une tâche (s). La live migration QEMU d'une VM running reçoit un timeout **adapté à sa taille** : `max(plancher, 2 × durée estimée par le débit observé)`, plafonné à 3600 s — une VM de 160 Go à ~150 Mo/s converge en plus de 600 s |
-| `PVE_LOG_FILE` | vide | Fichier de log parallèle (sans ANSI) |
+| `PVE_LOG_FILE` | vide | Fichier de log parallèle (sans ANSI, stderr capturé) |
 | `PVE_STATE_FILE` | auto | Emplacement du fichier d'état JSON |
 
 ## Limites connues

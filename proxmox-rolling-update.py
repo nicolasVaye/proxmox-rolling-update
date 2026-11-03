@@ -20,7 +20,15 @@ par étape et nœud par nœud : tables d'occupation RAM/CPU, VMs présentes par
 nœud, et plans de migration détaillés (quelle VM va où, avec impact).
 
 Arrêt propre sur toute erreur : le bloc `finally` tente de sortir tous les
-nœuds du mode maintenance avant de quitter.
+nœuds du mode maintenance avant de quitter. L'erreur est loggée (⛔ Échec)
+dans le fichier de log AVANT l'exit — y compris un échec de connexion
+initiale ; stderr (tracebacks, diagnostics bibliothèques) y est aussi
+dupliqué, plus jamais d'échec silencieux.
+
+Robustesse SSH : connexion PERSISTANTE par nœud (un seul handshake par
+nœud et par run, réutilisée pour toutes les commandes, recréée si morte —
+y compris après le reboot du nœud) ; retentatives PVE_SSH_RETRIES
+(défaut 3) avec délais progressifs 15/30/45 s.
 
 Usage :
     python3 proxmox_rolling_update.py --dry-run
@@ -84,6 +92,11 @@ SSH_PORT = int(_env("PVE_SSH_PORT", "22"))
 #   from="<ip_worker>",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA...
 # Une passphrase ne peut pas être demandée de manière interactive en tâche de fond.
 SSH_KEY_PASSPHRASE = _env("PVE_SSH_PASSPHRASE", "")   # "" => clé sans passphrase
+# Retentatives SSH par commande (PVE_SSH_RETRIES+1 tentatives), délais
+# progressifs 15/30/45 s (plafond 60) : de quoi traverser un ban
+# fail2ban temporaire ; la connexion persistante par nœud limite de
+# toute façon drastiquement le nombre de handshakes.
+SSH_RETRIES = int(_env("PVE_SSH_RETRIES", "3"))
 
 # Nœuds à traiter, dans l'ordre. Vide => tous les nœuds du cluster.
 NODE_ORDER: List[str] = []
@@ -374,6 +387,62 @@ class PlainFileFormatter(logging.Formatter):
         return f"{stamp} [{record.levelname:<8}] {self.PREFIX.get(record.levelno, '')} {record.getMessage()}".rstrip()
 
 
+class _StderrTee:
+    """Duplique stderr vers le(s) fichier(s) de log attaché(s) : les
+    tracebacks et diagnostics non loggés (paramiko, bibliothèques,
+    crash de dernière minute) arrivent AUSSI dans le fichier de log —
+    le terminal garde son affichage inchangé."""
+
+    def __init__(self, original):
+        self._original = original
+        self._sinks = []
+
+    def attach(self, stream) -> None:
+        if stream not in self._sinks:
+            self._sinks.append(stream)
+
+    def write(self, s):
+        try:
+            self._original.write(s)
+        except Exception:
+            pass
+        for fh in self._sinks:
+            try:
+                fh.write(s)
+                fh.flush()
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return self._original.isatty()
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+    def writable(self) -> bool:
+        return True
+
+    def close(self) -> None:  # ne JAMAIS fermer le vrai stderr
+        self.flush()
+
+
+def _tee_stderr_to(log_stream) -> None:
+    """Attache un fichier de log comme récepteur supplémentaire de
+    stderr (idempotent)."""
+    tee = sys.stderr
+    if not isinstance(tee, _StderrTee):
+        tee = _StderrTee(tee)
+        sys.stderr = tee
+    tee.attach(log_stream)
+
+
 def setup_logger(verbose: bool, log_file: Optional[str] = None,
                  no_color: bool = False, force_color: bool = False) -> logging.Logger:
     logger = logging.getLogger("pve-update")
@@ -387,9 +456,13 @@ def setup_logger(verbose: bool, log_file: Optional[str] = None,
     handlers = [handler]
     # Log fichier en parallèle : format sans ANSI, horodatage complet
     if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        # Stream ligne-buffered PARTAGÉ avec le tee stderr : un seul
+        # descripteur → ordre d'écriture préservé entre logger et stderr.
+        stream = open(log_file, "a", encoding="utf-8", buffering=1)
+        fh = logging.StreamHandler(stream)
         fh.setFormatter(PlainFileFormatter())
         handlers.append(fh)
+        _tee_stderr_to(stream)
     logger.handlers = handlers
     return logger
 
@@ -1506,6 +1579,10 @@ class ProxmoxClient:
     def __init__(self, logger: logging.Logger):
         self.log = logger
         self._ssh_pkey = None            # clé privée chargée à la demande (passphrase)
+        # Connexions SSH PERSISTANTES par nœud (un seul handshake par
+        # nœud et par run, réutilisé pour toutes les commandes ; recréée
+        # si morte — y compris après le reboot du nœud).
+        self._ssh_cli: Dict[str, object] = {}
         # proxmoxer >= 3.x expose 'ProxmoxAPI' ; les versions antérieures
         # utilisaient l'alias 'Proxmox'. On gère les deux pour compatibilité.
         try:
@@ -1850,7 +1927,7 @@ class ProxmoxClient:
         return self._ssh_pkey
 
     def _ssh(self, node: str, cmd: str, stream: bool = False,
-             retries: int = 2) -> str:
+             retries: Optional[int] = None) -> str:
         """Enveloppe de résilience : si la connexion SSH est perdue
         (micro-coupure réseau pendant un apt, nœud momentanément
         injoignable…), on attend, on RECONNECTE et on RE-JOUE la commande.
@@ -1863,11 +1940,16 @@ class ProxmoxClient:
           fin du premier — jamais de conflit de lock dpkg ;
         - ha-manager maintenance on/off : idempotent ;
         - uname / test / getent : lectures pures.
-        retries=2 => jusqu'à 3 tentatives (attente 10s puis 20s)."""
+        retries=None → PVE_SSH_RETRIES (défaut 3) => jusqu'à 4 tentatives
+        (attentes 15 s puis 30 s puis 45 s : traverse un ban fail2ban
+        temporaire ; la connexion persistante limite de toute façon
+        drastiquement le nombre de handshakes)."""
+        if retries is None:
+            retries = SSH_RETRIES
         last_exc: Optional[Exception] = None
         for attempt in range(retries + 1):
             if attempt:
-                wait = min(60, 10 * attempt)
+                wait = min(60, 15 * attempt)
                 self.log.warning(
                     f"Perte de connexion SSH avec {node} — nouvelle tentative "
                     f"{attempt + 1}/{retries + 1} dans {wait}s…")
@@ -1878,7 +1960,18 @@ class ProxmoxClient:
                 last_exc = e
         raise RuntimeError(
             f"{node} est resté injoignable en SSH après {retries + 1} "
-            f"tentatives ({last_exc})")
+            f"tentatives ({last_exc}) — si le nœud rejette les connexions "
+            f"en rafale, vérifiez fail2ban/sshguard ou la limite "
+            f"MaxStartups de sshd.")
+
+    def _ssh_drop(self, node: str) -> None:
+        """Ferme et oublie la connexion persistante du nœud (si présente)."""
+        cli = self._ssh_cli.pop(node, None)
+        if cli is not None:
+            try:
+                cli.close()
+            except Exception:
+                pass
 
     def _ssh_once(self, node: str, cmd: str, stream: bool = False) -> str:
         import paramiko
@@ -1886,19 +1979,34 @@ class ProxmoxClient:
         # Utiliser l'IP résolue lors de la découverte (le nom DNS peut ne pas
         # être résolvable depuis le worker, mais l'IP de gestion est connue).
         addr = self.node_addr.get(node, node)
-        cli = paramiko.SSHClient()
-        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            cli.connect(addr, port=SSH_PORT, username=SSH_USER,
-                        pkey=pkey, look_for_keys=False, allow_agent=True,
-                        timeout=30, banner_timeout=30, auth_timeout=30)
-        except Exception as e:
-            # échec d'ÉTABLISSEMENT de connexion : injoignable →
-            # retentable par l'enveloppe _ssh (coupure transitoire)
-            raise SshTransportLost(f"connexion SSH à {addr} impossible ({e})")
-        # Keepalive TCP : sans lui, une micro-coupure réseau prolongée
-        # n'est détectée par personne et readline() bloque pour toujours.
-        cli.get_transport().set_keepalive(15)
+        # Connexion PERSISTANTE : réutilisée si vivante, sinon recréée
+        # (nœud rebooté, micro-coupure prolongée…).
+        cli = self._ssh_cli.get(node)
+        if cli is not None:
+            try:
+                tr = cli.get_transport()
+                if tr is None or not tr.is_active():
+                    cli = None
+            except Exception:
+                cli = None
+            if cli is None:
+                self._ssh_drop(node)
+        if cli is None:
+            cli = paramiko.SSHClient()
+            cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                cli.connect(addr, port=SSH_PORT, username=SSH_USER,
+                            pkey=pkey, look_for_keys=False, allow_agent=True,
+                            timeout=30, banner_timeout=30, auth_timeout=30)
+            except Exception as e:
+                # échec d'ÉTABLISSEMENT de connexion : injoignable →
+                # retentable par l'enveloppe _ssh (coupure transitoire)
+                self._ssh_drop(node)
+                raise SshTransportLost(f"connexion SSH à {addr} impossible ({e})")
+            # Keepalive TCP : sans lui, une micro-coupure réseau prolongée
+            # n'est détectée par personne et readline() bloque pour toujours.
+            cli.get_transport().set_keepalive(15)
+            self._ssh_cli[node] = cli
         try:
             stdin, stdout, stderr = cli.exec_command(cmd, get_pty=True)
             stdin.close()
@@ -1951,8 +2059,10 @@ class ProxmoxClient:
                 raise RuntimeError(f"SSH '{cmd}' sur {node} a retourné {rc}"
                                    + (f" : {detail.strip()}" if detail.strip() else ""))
             return buf
-        finally:
-            cli.close()
+        except SshTransportLost:
+            # connexion morte : invalider le cache avant de retenter
+            self._ssh_drop(node)
+            raise
 
     # ---------- API helpers ----------
     def _diagnose_nodes(self, nostats: List[str],
@@ -5672,17 +5782,23 @@ def main():
     env_log_file = _env("PVE_LOG_FILE", "").strip()
     if env_log_file and not args.log_file:
         try:
-            fh = logging.FileHandler(env_log_file, encoding="utf-8")
+            # Stream ligne-buffered PARTAGÉ avec le tee stderr : un seul
+            # descripteur → ordre d'écriture préservé entre logger et
+            # stderr (tracebacks, diagnostics bibliothèques).
+            stream = open(env_log_file, "a", encoding="utf-8", buffering=1)
+            fh = logging.StreamHandler(stream)
             fh.setFormatter(PlainFileFormatter())
             logger.addHandler(fh)
-            logger.info(f"Logs également écrits dans : {env_log_file}")
+            _tee_stderr_to(stream)
+            logger.info(f"Logs également écrits dans : {env_log_file} "
+                        f"(stderr y est aussi capturé)")
         except OSError as e:
             logger.warning(f"Fichier de log '{env_log_file}' inutilisable ({e}) "
                            f"— poursuite sans log fichier.")
     # Relecture des constantes maintenant que l'environnement est chargé
     # (elles ont été évaluées avant le chargement du fichier d'env).
     global API_HOST, API_HOSTS, API_USER, API_TOKEN_NAME, API_TOKEN_VALUE, VERIFY_SSL
-    global SSH_USER, SSH_PRIVATE_KEY, SSH_PORT, SSH_KEY_PASSPHRASE
+    global SSH_USER, SSH_PRIVATE_KEY, SSH_PORT, SSH_KEY_PASSPHRASE, SSH_RETRIES
     global WITH_LOCAL_DISKS
     global EST_MIGRATE_SPEED, EST_MIGRATE_OVERHEAD_S
     global EST_APT_MIN, EST_UPGRADE_MIN, EST_REBOOT_MIN
@@ -5769,6 +5885,7 @@ def main():
     SSH_PRIVATE_KEY = _env("PVE_SSH_KEY", SSH_PRIVATE_KEY)
     SSH_PORT = int(_env("PVE_SSH_PORT", str(SSH_PORT)))
     SSH_KEY_PASSPHRASE = _env("PVE_SSH_PASSPHRASE", "")
+    SSH_RETRIES = int(_env("PVE_SSH_RETRIES", str(SSH_RETRIES)))
     WITH_LOCAL_DISKS = _env("PVE_WITH_LOCAL_DISKS", str(WITH_LOCAL_DISKS)).lower() in ("1", "true", "yes")
     logger.info(f"Marges RAM : {margins_desc()}")
     # Diagnostic : la passphrase SSH est-elle disponible AVANT tout usage ?
@@ -5782,11 +5899,13 @@ def main():
     # cluster (lecture seule) est nécessaire aussi bien en dry-run (pour
     # simuler sur l'état réel) qu'en exécution. C'est le paramètre `dry`
     # passé à l'Updater qui garantit qu'AUCUNE action d'écriture n'est
-    # effectuée sur les nœuds en mode dry-run.
-    client = ProxmoxClient(logger)
-
-    updater = Updater(logger, dry, client)
+    # effectuée sur les nœuds en mode dry-run. L'instanciation est DANS
+    # le try : un échec de connexion initiale est loggée dans le fichier
+    # de log (plus jamais de traceback brut perdu hors log).
     try:
+        client = ProxmoxClient(logger)
+
+        updater = Updater(logger, dry, client)
         updater.run(args.node)
         sys.exit(0)
     except KeyboardInterrupt:
@@ -5800,7 +5919,11 @@ def main():
                         "run : l'Étape 0 reprendra le reste via le "
                         "fichier d'état si besoin.")
         sys.exit(130)
-    except Exception:
+    except Exception as e:
+        # Les erreurs du run sont déjà loggées (⛔ Échec) par run() ;
+        # celle-ci couvre les échecs ANTÉRIEURS (connexion initiale,
+        # inventaire) et confirme la sortie en échec dans le log.
+        logger.error(f"Run échoué : {e}")
         sys.exit(2)
 
 

@@ -14,14 +14,18 @@ Trois actions MUTUELLEMENT EXCLUSIVES :
      nœud (mon → mgr → osd → mds), SANS reboot du nœud, avec gates de
      santé Ceph entre chaque nœud et chaque type de daemon.
 
-  2. --major RELEASE : changement de version majeure (ex. reef → squid),
-     procédure officielle Proxmox (wiki Ceph_*_to_*) : bascule du dépôt
-     apt sur TOUS les nœuds, apt full-upgrade sur tous les nœuds (les
-     binaires nouveaux sont installés mais les anciens tournent encore),
-     PUIS passes de redémarrage PAR TYPE DE DAEMON : mons un par un →
-     vérification min_mon_release → mgrs → OSDs nœud par nœud →
-     « ceph osd require-osd-release » → MDS (procédure max_mds) → retrait
-     des flags de maintenance.
+  2. --major RELEASE : changement de version majeure (ex. squid →
+     tentacle), procédure officielle Proxmox (wiki Ceph_*_to_*) :
+     préflight renforcé (montée d'EXACTEMENT une release majeure —
+     descente et saut refusés ; prérequis de la release cible :
+     pve-manager/ceph minimaux), puis bascule du dépôt apt sur TOUS
+     les nœuds, apt full-upgrade sur tous les nœuds (les binaires
+     nouveaux sont installés mais les anciens tournent encore), PUIS
+     passes de redémarrage PAR TYPE DE DAEMON : mons un par un →
+     vérification min_mon_release → mgrs → OSDs nœud par nœud → MDS
+     (procédure max_mds) → vérification que TOUTES les OSDs tournent
+     sur la nouvelle release → « ceph osd require-osd-release » →
+     retrait des flags de maintenance.
 
   3. --rotate-keys    : remédiation CVE-2025-30156 (Ceph Squid 19.2.6 /
      Tentacle 20.2.4 — AES-CBC non authentifié dans CephX, bypass
@@ -49,11 +53,24 @@ L'inventaire et les gates de l'ÉTAPE 0 sont de pures lectures (API +
 SSH), tout le reste est simulé ligne par ligne, avec la commande EXACTE
 qui serait exécutée, et un bilan d'estimation final.
 
+ROBUSTESSE / DIAGNOSTIC :
+- Connexion SSH PERSISTANTE par nœud : un seul handshake par nœud et
+  par run (réutilisée pour toutes les commandes) — évite les rejets
+  fail2ban/sshd lors des dizaines de lectures d'un run. Retentatives
+  (PVE_SSH_RETRIES, défaut 3) avec délais progressifs 15/30/45 s.
+- Tout ce qui arrive sur stderr (tracebacks, diagnostics bibliothèques)
+  est AUSSI écrit dans le fichier de log — plus rien de perdu.
+- En cas d'échec, l'erreur est loggée (RUN INTERROMPU) AVANT le bilan,
+  et le bilan signale explicitement le run interrompu (les compteurs
+  ne sont PAS ceux d'un run complet) ; les flags de maintenance sont
+  retirés par le bloc finally et le run est relançable (reprise).
+
 Usage :
     python3 proxmox_ceph_rolling_update.py --dry-run
     python3 proxmox_ceph_rolling_update.py --execute
     python3 proxmox_ceph_rolling_update.py --execute --node pve-node2
-    python3 proxmox_ceph_rolling_update.py --execute --major squid
+    python3 proxmox_ceph_rolling_update.py --dry-run  --major tentacle
+    python3 proxmox_ceph_rolling_update.py --execute --major tentacle
     python3 proxmox_ceph_rolling_update.py --execute --rotate-keys
 
 NB : --node n'est supporté qu'en mode mineur (le mode majeur exige de
@@ -97,6 +114,11 @@ SSH_USER = _env("PVE_SSH_USER", "root")
 SSH_PRIVATE_KEY = _env("PVE_SSH_KEY", "/etc/proxmox-updater/id_ed25519")
 SSH_PORT = int(_env("PVE_SSH_PORT", "22"))
 SSH_KEY_PASSPHRASE = _env("PVE_SSH_PASSPHRASE", "")
+# Retentatives SSH par commande (PVE_SSH_RETRIES+1 tentatives), délais
+# progressifs 15/30/45 s (plafond 60) — pour traverser un ban fail2ban
+# temporaire ; la connexion persistante par nœud limite de toute façon
+# drastiquement le nombre de handshakes.
+SSH_RETRIES = int(_env("PVE_SSH_RETRIES", "3"))
 
 # --- Gates / attentes Ceph -------------------------------------------------
 # Timeout global d'attente de stabilisation (santé OK + PGs active+clean)
@@ -142,6 +164,13 @@ EST_STABILIZE_S = float(_env("PVE_EST_STABILIZE_S", "60"))
 # Releases Ceph connues de Proxmox (pour la validation de --major).
 KNOWN_RELEASES = {
     "squid": 19, "tentacle": 20, "reef": 18, "quincy": 17,
+}
+
+# Prérequis de la release CIBLE d'une montée majeure (wiki officiel
+# Proxmox Ceph_Squid_to_Tentacle : PVE ≥ 9.1 avec pve-manager ≥ 9.1.4
+# et ceph ≥ 19.2.3). Vérifiés nœud par nœud en préflight.
+MAJOR_PREREQS = {
+    "tentacle": {"pve": (9, 1, 4), "ceph": (19, 2, 3)},
 }
 
 # Version Ceph MINIMALE qui corrige CVE-2025-30156, par branche.
@@ -209,6 +238,62 @@ class PlainFileFormatter(logging.Formatter):
                 f"{record.getMessage()}").rstrip()
 
 
+class _StderrTee:
+    """Duplique stderr vers le(s) fichier(s) de log attaché(s) : les
+    tracebacks et diagnostics non loggés (paramiko, bibliothèques,
+    crash de dernière minute) arrivent AUSSI dans le fichier de log —
+    le terminal garde son affichage inchangé."""
+
+    def __init__(self, original):
+        self._original = original
+        self._sinks = []
+
+    def attach(self, stream) -> None:
+        if stream not in self._sinks:
+            self._sinks.append(stream)
+
+    def write(self, s):
+        try:
+            self._original.write(s)
+        except Exception:
+            pass
+        for fh in self._sinks:
+            try:
+                fh.write(s)
+                fh.flush()
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return self._original.isatty()
+
+    def fileno(self) -> int:
+        return self._original.fileno()
+
+    def writable(self) -> bool:
+        return True
+
+    def close(self) -> None:  # ne JAMAIS fermer le vrai stderr
+        self.flush()
+
+
+def _tee_stderr_to(log_stream) -> None:
+    """Attache un fichier de log comme récepteur supplémentaire de
+    stderr (idempotent, installable avant le chargement de l'env)."""
+    tee = sys.stderr
+    if not isinstance(tee, _StderrTee):
+        tee = _StderrTee(tee)
+        sys.stderr = tee
+    tee.attach(log_stream)
+
+
 def setup_logger(verbose: bool, log_file: Optional[str] = None,
                  no_color: bool = False, force_color: bool = False) -> logging.Logger:
     logger = logging.getLogger("pve-ceph-update")
@@ -218,9 +303,13 @@ def setup_logger(verbose: bool, log_file: Optional[str] = None,
     handler.setFormatter(ColorFormatter())
     handlers = [handler]
     if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        # Stream ligne-buffered PARTAGÉ avec le tee stderr : un seul
+        # descripteur → ordre d'écriture préservé entre logger et stderr.
+        stream = open(log_file, "a", encoding="utf-8", buffering=1)
+        fh = logging.StreamHandler(stream)
         fh.setFormatter(PlainFileFormatter())
         handlers.append(fh)
+        _tee_stderr_to(stream)
     logger.handlers = handlers
     return logger
 
@@ -261,6 +350,9 @@ class ProxmoxClient:
     def __init__(self, logger: logging.Logger):
         self.log = logger
         self._ssh_pkey = None
+        # Connexions SSH PERSISTANTES par nœud (un seul handshake par
+        # nœud et par run, réutilisé pour toutes les commandes).
+        self._ssh_cli: Dict[str, object] = {}
         try:
             from proxmoxer import ProxmoxAPI as _PxmApiClass
         except ImportError:
@@ -442,11 +534,13 @@ class ProxmoxClient:
         return self._ssh_pkey
 
     def _ssh(self, node: str, cmd: str, stream: bool = False,
-             retries: int = 2) -> str:
+             retries: Optional[int] = None) -> str:
+        if retries is None:
+            retries = SSH_RETRIES
         last_exc: Optional[Exception] = None
         for attempt in range(retries + 1):
             if attempt:
-                wait = min(60, 10 * attempt)
+                wait = min(60, 15 * attempt)
                 self.log.warning(f"Perte de connexion SSH avec {node} — nouvelle "
                                  f"tentative {attempt + 1}/{retries + 1} dans {wait}s…")
                 time.sleep(wait)
@@ -455,21 +549,47 @@ class ProxmoxClient:
             except SshTransportLost as e:
                 last_exc = e
         raise RuntimeError(f"{node} est resté injoignable en SSH après "
-                            f"{retries + 1} tentatives ({last_exc})")
+                            f"{retries + 1} tentatives ({last_exc}) — si le "
+                            f"nœud rejette les connexions en rafale, "
+                            f"vérifiez fail2ban/sshguard ou la limite "
+                            f"MaxStartups de sshd.")
+
+    def _ssh_drop(self, node: str) -> None:
+        """Ferme et oublie la connexion persistante du nœud (si présente)."""
+        cli = self._ssh_cli.pop(node, None)
+        if cli is not None:
+            try:
+                cli.close()
+            except Exception:
+                pass
 
     def _ssh_once(self, node: str, cmd: str, stream: bool = False) -> str:
         import paramiko
         pkey = self._get_ssh_pkey()
         addr = self.node_addr.get(node, node)
-        cli = paramiko.SSHClient()
-        cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            cli.connect(addr, port=SSH_PORT, username=SSH_USER,
-                        pkey=pkey, look_for_keys=False, allow_agent=True,
-                        timeout=30, banner_timeout=30, auth_timeout=30)
-        except Exception as e:
-            raise SshTransportLost(f"connexion SSH à {addr} impossible ({e})")
-        cli.get_transport().set_keepalive(15)
+        # Connexion PERSISTANTE : réutilisée si vivante, sinon recréée.
+        cli = self._ssh_cli.get(node)
+        if cli is not None:
+            try:
+                tr = cli.get_transport()
+                if tr is None or not tr.is_active():
+                    cli = None
+            except Exception:
+                cli = None
+            if cli is None:
+                self._ssh_drop(node)
+        if cli is None:
+            cli = paramiko.SSHClient()
+            cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                cli.connect(addr, port=SSH_PORT, username=SSH_USER,
+                            pkey=pkey, look_for_keys=False, allow_agent=True,
+                            timeout=30, banner_timeout=30, auth_timeout=30)
+            except Exception as e:
+                self._ssh_drop(node)
+                raise SshTransportLost(f"connexion SSH à {addr} impossible ({e})")
+            cli.get_transport().set_keepalive(15)
+            self._ssh_cli[node] = cli
         try:
             stdin, stdout, stderr = cli.exec_command(cmd, get_pty=True)
             stdin.close()
@@ -509,8 +629,10 @@ class ProxmoxClient:
                 raise RuntimeError(f"SSH '{cmd}' sur {node} a retourné {rc}"
                                    + (f" : {detail.strip()}" if detail.strip() else ""))
             return buf
-        finally:
-            cli.close()
+        except SshTransportLost:
+            # connexion morte : invalider le cache avant de retenter
+            self._ssh_drop(node)
+            raise
 
     def ssh_any(self, cmd: str, prefer: Optional[str] = None,
                 nodes: Optional[List[str]] = None) -> Tuple[str, str]:
@@ -830,6 +952,18 @@ class ProxmoxClient:
         except Exception:
             return "?"
 
+    def pve_manager_version(self, node: str) -> Tuple[int, ...]:
+        """Version de pve-manager sur un nœud (ex. (9, 2, 20)). ()
+        si indéterminée — ne bloque jamais le run par principe."""
+        try:
+            out = self._ssh(node, "pveversion")
+            m = re.search(r"pve-manager/(\d+(?:\.\d+)*)", out)
+            if m:
+                return tuple(int(x) for x in m.group(1).split("."))
+        except Exception:
+            pass
+        return ()
+
     def ceph_repo_branch(self, node: str) -> str:
         """Branche du dépôt Ceph configurée sur le nœud (ex. squid)."""
         try:
@@ -1020,6 +1154,8 @@ class CephUpdater:
         self.nodes: List[str] = []
         self.flags_we_set: Dict[str, bool] = {}
         self.t_start = time.time()
+        # message d'erreur si le run a été INTERROMPU (bilan final)
+        self.aborted: Optional[str] = None
         # compteurs du bilan
         self.counts = {"pkg_nodes": 0, "restarts": 0, "keys_rotated": 0,
                        "gates": 0}
@@ -1263,14 +1399,119 @@ class CephUpdater:
                 raise RuntimeError(
                     f"Release « {rel} » inconnue (releases supportées : "
                     f"{', '.join(sorted(KNOWN_RELEASES))}).")
+            num = KNOWN_RELEASES[rel]
+            # Garde 1 — montée d'EXACTEMENT une release majeure (Ceph ne
+            # supporte NI la descente NI le saut de release) :
+            self._major_target_sanity(rel, num)
+            # Garde 2 — prérequis de la release cible (wiki officiel) :
+            self._major_prereqs(rel, num)
+            # Piège connu du wiki (OSDs créées sous Octopus ou avant) :
+            self.log.warning(
+                "Piège connu du wiki : des OSDs créées sous Octopus (v15) "
+                "ou avant peuvent voir leur usage META (RocksDB non "
+                "shardé) fortement augmenter APRÈS la montée — vérifiez "
+                "« ceph osd df » (colonne META) après le run ; "
+                "contournement : « ceph daemon osd.N compact » un par un.")
             self.log.info(f"Action MAJEURE : bascule vers Ceph {rel} "
-                          f"(major {KNOWN_RELEASES[rel]}). Procédure "
-                          f"officielle Proxmox : dépôt sur tous les nœuds → "
-                          f"paquets sur tous les nœuds → mons → mgrs → "
-                          f"OSDs → require-osd-release → MDS.")
+                          f"(major {num}). Procédure officielle Proxmox : "
+                          f"dépôt sur tous les nœuds → paquets sur tous "
+                          f"les nœuds → mons → mgrs → OSDs → MDS → "
+                          f"require-osd-release.")
         if self.action == "rotate-keys":
             return self._rotate_keys_preflight(st)
         return True
+
+    def _major_releases_running(self) -> List[Tuple[int, str]]:
+        """Releases majeures courantes des MONs (« ceph versions ») :
+        [(num, nom)] trié, [] si indéterminable."""
+        versions = self.client.ceph_versions()
+        found = set()
+        for ver in (versions.get("mon") or {}):
+            for name, num in KNOWN_RELEASES.items():
+                if re.search(rf"\b{name}\b", ver):
+                    found.add((num, name))
+        return sorted(found)
+
+    def _major_target_sanity(self, rel: str, num: int) -> None:
+        """Refuse les descentes et les sauts de release majeure (Ceph ne
+        supporte que les montées N → N+1) ; autorise la REPRISE d'une
+        montée interrompue (versions mixtes → cible = release haute)."""
+        running = self._major_releases_running()
+        if not running:
+            self.log.warning(
+                "Release courante indéterminable (« ceph versions » vide) "
+                f"— vérifiez manuellement que {rel} est bien la release "
+                f"SUIVANTE de celle qui tourne.")
+            return
+        names = " + ".join(n for _, n in running)
+        if len(running) > 1:
+            hi_num, hi = running[-1]
+            if num == hi_num:
+                self.log.info(
+                    f"Mons en versions MIXTES ({names}) : reprise d'une "
+                    f"montée interrompue vers {rel} — poursuite.")
+                return
+            raise RuntimeError(
+                f"Mons en versions MIXTES ({names}) : une montée vers "
+                f"{hi} est interrompue en cours — terminez d'abord la "
+                f"reprise (--major {hi}), visez {rel} ensuite.")
+        cur_num, cur = running[0]
+        if num < cur_num:
+            raise RuntimeError(
+                f"Descente refusée : le cluster tourne déjà {cur} "
+                f"(major {cur_num}) — cibler {rel} (major {num}) n'est "
+                f"pas une montée.")
+        if num > cur_num + 1:
+            raise RuntimeError(
+                f"Saut de release refusé : Ceph ne supporte que les "
+                f"montées N → N+1. Le cluster tourne {cur} (major "
+                f"{cur_num}) — montez d'abord vers la release suivante.")
+        if num == cur_num:
+            self.log.info(
+                f"Cluster déjà sur {cur} — le run bascule/sécurise les "
+                f"éléments restants (dépôt, paquets, min_mon_release…).")
+
+    def _major_prereqs(self, rel: str, num: int) -> None:
+        """Prérequis de la release cible (wiki officiel), par nœud :
+        version minimale du paquet ceph ET de pve-manager."""
+        req = MAJOR_PREREQS.get(rel) or {}
+        pv: Tuple[int, ...] = req.get("pve", ())
+        cv: Tuple[int, ...] = req.get("ceph", ())
+        if not req:
+            return
+        if not self.nodes:
+            raise RuntimeError("Inventaire des nœuds vide — impossible de "
+                               "vérifier les prérequis de la montée.")
+        cv_txt = ".".join(str(x) for x in cv)
+        pv_txt = ".".join(str(x) for x in pv)
+        for node in self.nodes:
+            pkg = self.client.pkg_ceph_version(node)
+            m = re.match(r"(\d+)\.(\d+)\.(\d+)", pkg or "")
+            if m:
+                got = tuple(int(x) for x in m.groups())
+                if cv and got < cv:
+                    raise RuntimeError(
+                        f"{node} : paquet ceph {pkg} < minimum requis "
+                        f"{cv_txt} pour la montée vers {rel} (wiki) — "
+                        f"faites d'abord une passe MINEURE (mise à jour "
+                        f"des paquets).")
+            else:
+                self.log.warning(
+                    f"{node} : version du paquet ceph indéchiffrable "
+                    f"({pkg}) — vérifiez manuellement le prérequis "
+                    f">= {cv_txt}.")
+            if pv:
+                pve = self.client.pve_manager_version(node)
+                if not pve:
+                    self.log.warning(
+                        f"{node} : version de pve-manager indéterminée — "
+                        f"vérifiez manuellement le prérequis >= {pv_txt}.")
+                elif pve < pv:
+                    pve_txt = ".".join(str(x) for x in pve)
+                    raise RuntimeError(
+                        f"{node} : pve-manager {pve_txt} < minimum requis "
+                        f"{pv_txt} pour la montée vers {rel} (wiki) — "
+                        f"terminez d'abord le rolling update PVE.")
 
     def _rotate_keys_preflight(self, st: Dict) -> bool:
         """Gates propres à la remédiation CVE-2025-30156. Retourne False
@@ -1536,13 +1777,38 @@ class CephUpdater:
             self.counts["restarts"] += 1
             self._est(EST_RESTART_OSD_S)
             self._gate(f"restart des OSDs de {node}", node=node)
-        # ---- Phase F : version minimale des OSDs ----
-        banner(self.log, f"PHASE F — Interdiction des OSDs antérieurs à "
+        # ---- Phase F : MDS (AVANT require-osd-release, comme le wiki) ----
+        self._major_mds()
+        # ---- Phase G : version minimale des OSDs ----
+        banner(self.log, f"PHASE G — Interdiction des OSDs antérieurs à "
                          f"{rel} (« require-osd-release »)")
+        if self.dry:
+            self._sim(f"hypothèse : toutes les OSDs tournent en {rel} "
+                      f"après la Phase E (vérification réelle : "
+                      f"« ceph versions » → osd)")
+        else:
+            versions = self.client.ceph_versions()
+            osds = versions.get("osd") or {}
+            if not osds:
+                raise RuntimeError(
+                    f"Versions des OSDs illisibles (« ceph versions ») — "
+                    f"require-osd-release DIFFÉRÉ : sans preuve que "
+                    f"TOUTES les OSDs sont en {rel}, un daemon ancien ne "
+                    f"pourrait plus redémarrer ensuite. Diagnostiquez, "
+                    f"puis relancez (reprise).")
+            late = [f"{nb}× {ver}" for ver, nb in sorted(osds.items())
+                    if not re.match(rf"ceph version {num}\.", ver)]
+            if late:
+                raise RuntimeError(
+                    f"OSD(s) pas toutes en {rel} ({'; '.join(late)}) — "
+                    f"require-osd-release DIFFÉRÉ : un daemon ancien ne "
+                    f"pourrait plus redémarrer ensuite. Diagnostiquez "
+                    f"(« ceph versions », « ceph osd tree »), puis "
+                    f"relancez (reprise là où le run s'est arrêté).")
+            self.log.info(f"Toutes les OSDs tournent en {rel} ✔ — "
+                          f"require-osd-release posable sans risque.")
         self._mut(f"ceph osd require-osd-release {rel}",
                   desc="version minimale des OSDs")
-        # ---- Phase G : MDS ----
-        self._major_mds()
 
     def _major_mds(self) -> None:
         """Procédure MDS du wiki Proxmox : standby_replay off, max_mds→1,
@@ -1555,7 +1821,7 @@ class CephUpdater:
         if not fs_list or not mds_nodes:
             self.log.info("Aucun CephFS / aucun MDS — phase MDS sans objet.")
             return
-        banner(self.log, f"PHASE G — Upgrade des MDS ({', '.join(fs_list)})")
+        banner(self.log, f"PHASE F — Upgrade des MDS ({', '.join(fs_list)})")
         # 1) réglages d'origine + réduction à 1 rank actif
         orig: Dict[str, Tuple[int, str]] = {}
         for fs in fs_list:
@@ -2212,6 +2478,13 @@ class CephUpdater:
     # ---------------- Bilan final ----------------
     def final_report(self) -> None:
         banner(self.log, "BILAN — Ceph rolling update", ColorFormatter.MAGENTA)
+        if self.aborted:
+            self.log.critical(
+                f"⚠ RUN INTERROMPU (les compteurs ci-dessous ne sont "
+                f"PAS ceux d'un run complet) : {self.aborted}")
+            self.log.critical(
+                "  Flags de maintenance retirés par le bloc finally — "
+                "le run est RELANÇABLE (reprise là où il s'est arrêté).")
         st = self.client.ceph_status()
         if st is None:
             self.log.error("Ceph injoignable pour le bilan final.")
@@ -2299,6 +2572,12 @@ class CephUpdater:
             finally:
                 self._flags_off()
                 self._state_clear()
+        except Exception as e:
+            # L'erreur est loggée ICI (donc dans le fichier de log) AVANT
+            # le bilan — plus jamais d'échec silencieux en exit(2).
+            self.aborted = str(e)
+            self.log.critical(f"RUN INTERROMPU : {e}")
+            raise
         finally:
             self.final_report()
 
@@ -2338,9 +2617,11 @@ def main():
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--major", metavar="RELEASE",
                         help="Changement de version MAJEURE (ex. --major "
-                             "squid) : bascule du dépôt + paquets sur tous "
+                             "tentacle) : bascule du dépôt + paquets sur tous "
                              "les nœuds + redémarrages par type de daemon "
-                             "(mons → mgrs → OSDs → MDS).")
+                             "(mons → mgrs → OSDs → MDS → require-osd-"
+                             "release). Montée d'EXACTEMENT une release "
+                             "(descente et saut refusés en préflight).")
     action.add_argument("--rotate-keys", action="store_true",
                         help="Remédiation CVE-2025-30156 : rotation de "
                              "toutes les clés CephX « aes » vers "
@@ -2387,16 +2668,22 @@ def main():
     env_log_file = _env("PVE_LOG_FILE", "").strip()
     if env_log_file and not args.log_file:
         try:
-            fh = logging.FileHandler(env_log_file, encoding="utf-8")
+            # Stream ligne-buffered PARTAGÉ avec le tee stderr :
+            # un seul descripteur → ordre d'écriture préservé.
+            stream = open(env_log_file, "a", encoding="utf-8", buffering=1)
+            fh = logging.StreamHandler(stream)
             fh.setFormatter(PlainFileFormatter())
             logger.addHandler(fh)
-            logger.info(f"Logs également écrits dans : {env_log_file}")
+            _tee_stderr_to(stream)
+            logger.info(f"Logs également écrits dans : {env_log_file} "
+                        f"(stderr y est aussi capturé)")
         except OSError as e:
             logger.warning(f"Fichier de log '{env_log_file}' inutilisable "
                            f"({e}) — poursuite sans log fichier.")
     # Relecture des constantes maintenant que l'env est chargé
     global API_HOST, API_HOSTS, API_USER, API_TOKEN_NAME, API_TOKEN_VALUE
     global VERIFY_SSL, SSH_USER, SSH_PRIVATE_KEY, SSH_PORT, SSH_KEY_PASSPHRASE
+    global SSH_RETRIES
     global CEPH_STABLE_TIMEOUT, CEPH_MAX_DEGRADED_PGS, CEPH_POLL_S
     global CEPH_UTIL_MAX_PCT, STATE_FILE, KEY_BACKUP_DIR
     global EST_APT_MIN, EST_UPGRADE_MIN, EST_RESTART_MON_S, EST_RESTART_MGR_S
@@ -2414,6 +2701,7 @@ def main():
     SSH_PRIVATE_KEY = _env("PVE_SSH_KEY", SSH_PRIVATE_KEY)
     SSH_PORT = int(_env("PVE_SSH_PORT", str(SSH_PORT)))
     SSH_KEY_PASSPHRASE = _env("PVE_SSH_PASSPHRASE", "")
+    SSH_RETRIES = int(_env("PVE_SSH_RETRIES", str(SSH_RETRIES)))
     CEPH_STABLE_TIMEOUT = int(_env("PVE_CEPH_STABLE_TIMEOUT",
                                    str(CEPH_STABLE_TIMEOUT)))
     CEPH_MAX_DEGRADED_PGS = int(_env("PVE_CEPH_MAX_DEGRADED_PGS",
@@ -2466,7 +2754,8 @@ def main():
                         "entités déjà migrées seront détectées et sautées "
                         "au prochain run (reprise).")
         sys.exit(130)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Run échoué : {e}")
         sys.exit(2)
 
 
