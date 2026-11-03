@@ -361,6 +361,7 @@ Détails d'implémentation :
 | `PVE_EST_REBOOT_MIN` | `9` | reboot + retour + post-checks (min/nœud), bilan dry-run |
 | `PVE_STATS_FILE` | auto | Fichier de statistiques de durées (défaut : `.proxmox-rolling-update.stats` à côté du script) |
 | `PVE_STATS_MAX_SAMPLES` | `20` | Fenêtre glissante d'échantillons par catégorie |
+| `PVE_MIGRATE_TIMEOUT` | `600` | Plancher du timeout d'attente d'une tâche (s). La live migration QEMU d'une VM running reçoit un timeout **adapté à sa taille** : `max(plancher, 2 × durée estimée par le débit observé)`, plafonné à 3600 s — une VM de 160 Go à ~150 Mo/s converge en plus de 600 s |
 | `PVE_LOG_FILE` | vide | Fichier de log parallèle (sans ANSI) |
 | `PVE_STATE_FILE` | auto | Emplacement du fichier d'état JSON |
 

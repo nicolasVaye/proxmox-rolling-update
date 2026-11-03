@@ -130,7 +130,17 @@ def rebalance_threshold(state: "ClusterState") -> float:
         return min(1.0, state.theoretical_gap + 0.01)
     return 0.10
 CPU_SAFETY_MARGIN = 0.20        # ne pas dépasser 80% de CPU moyen estimé
-MIGRATE_TIMEOUT = 600           # secondes max par migration
+MIGRATE_TIMEOUT = int(_env("PVE_MIGRATE_TIMEOUT", "600"))
+                                # plancher du timeout d'attente d'une tâche
+                                # (s) ; la live migration QEMU d'une VM
+                                # running reçoit un timeout ADAPTÉ à sa
+                                # taille (cf. _migrate_timeout_for) : une
+                                # VM de 160 Go à ~150 Mo/s converge en
+                                # >600s — un plancher FIXE la tuerait en
+                                # pleine convergence.
+MIGRATE_TIMEOUT_MAX = 3600      # plafond du timeout adapté (garde-fou)
+MIGRATE_TIMEOUT_FACTOR = 2.0    # marge : timeout = max(plancher, FACTEUR ×
+                                # durée estimée par le modèle de débit)
 CEPH_TIMEOUT = 900              # secondes max d'attente d'un Ceph HEALTH_OK
 REBOOT_TIMEOUT = 900            # secondes max d'attente du retour d'un nœud
 
@@ -165,10 +175,25 @@ STATS_FILE = _env("PVE_STATS_FILE",
 STATS_MAX_SAMPLES = int(_env("PVE_STATS_MAX_SAMPLES", "20"))
                                 # fenêtre glissante : les N derniers
                                 # échantillons par catégorie (le cluster
-#                               # évolue, les vieilles mesures dérivent)
+                                # évolue, les vieilles mesures dérivent)
 
 # provenance des EST_* pour le bilan final : {clé: "stats (n=5)"|"défaut"}
 EST_PROV: Dict[str, str] = {}
+
+
+def _migrate_timeout_for(ram: int) -> int:
+    """Timeout EFFECTIF d'une live migration QEMU de `ram` octets :
+        max(PVE_MIGRATE_TIMEOUT, FACTEUR × durée estimée), plafonné.
+    Durée estimée = ram/EST_MIGRATE_SPEED + EST_MIGRATE_OVERHEAD_S —
+    c'est-à-dire le débit OBSERVÉ sur VOTRE cluster dès que le fichier
+    de statistiques contient des échantillons, sinon le défaut. Vécu :
+    une VM de 160 Go chargée (63% CPU → pages sales sans cesse) converge
+    en ~800-1100s au débit réel ; un plancher FIXE de 600s tuait la
+    tâche en pleine migration. Le FACTEUR ×2 absorbe la dispersion
+    (pages sales, bande passante, charge réseau de migration)."""
+    est = ram / max(EST_MIGRATE_SPEED, 1) + EST_MIGRATE_OVERHEAD_S
+    return int(min(max(MIGRATE_TIMEOUT, MIGRATE_TIMEOUT_FACTOR * est),
+                   MIGRATE_TIMEOUT_MAX))
 
 
 def load_stats() -> Optional[Dict]:
@@ -1499,6 +1524,7 @@ class ProxmoxClient:
         # Bilan dry-run : détection des guests avec disque sur stockage
         # NON partagé, mémoïsée par (vmtype, vmid) -> True/False/None.
         self._vm_local_disks: Dict[Tuple[str, int], Optional[bool]] = {}
+        self._vm_onboot: Dict[Tuple[str, int], Optional[bool]] = {}
         # Storages partagés par nœud (GET /nodes/{node}/storage) :
         # None = échec MÉMOÏSÉ pour ce nœud — les guests suivants ne
         # redéclenchent PAS un cycle de bascule d'hôte API complet.
@@ -2326,12 +2352,15 @@ class ProxmoxClient:
         et CONTENEURS LXC ('ct:')."""
         return set(self.ha_sids().keys())
 
-    def wait_ha_settled(self, timeout: int = MIGRATE_TIMEOUT,
+    def wait_ha_settled(self, timeout: Optional[int] = None,
                         stable_window: int = 60):
         """Attend que le CRM HA n'ait plus AUCUNE tâche en cours sur les
         ressources (états transitoires : migrate, relocate, recover,
         fence, freeze, lost). En fin de run, garantir un cluster stable
         avant le rapport final.
+        timeout=None → MIGRATE_TIMEOUT lu À L'APPEL (le défaut d'un
+        argument serait figé à sa valeur d'import, avant la relecture
+        du --env-file par main()).
 
         NB : un instantané unique ne suffit PAS. À la sortie du mode
         maintenance, le CRM met plusieurs secondes (voire dizaines) à
@@ -2340,6 +2369,8 @@ class ProxmoxClient:
         précéder de peu une migration. On exige donc que l'état soit
         stable PENDANT stable_window secondes consécutives : toute
         tâche qui démarre dans la fenêtre réarme le compteur."""
+        if timeout is None:
+            timeout = MIGRATE_TIMEOUT
         transient = ("migrate", "relocate", "recover", "fence", "freeze", "lost")
         t0 = time.time()
         stable_since = None
@@ -2818,7 +2849,7 @@ class ProxmoxClient:
         self.log.info(f"Ceph HEALTH_OK, OSDs de {node} opérationnels ✔")
 
     def wait_ha_evacuated(self, node: str, ha_vmids: Set[int],
-                          timeout: int = MIGRATE_TIMEOUT):
+                          timeout: Optional[int] = None):
         """Attend que le CRM ait évacué TOUTES les ressources HA du nœud,
         en deux conditions :
         1. plus aucune entrée /cluster/ha/resources ne pointe sur le nœud ;
@@ -2826,9 +2857,12 @@ class ProxmoxClient:
            l'entrée ressource change dès que la migration est DÉCLENCHÉE,
            mais la VM (live-)migre encore : migrer un guest dont la
            migration HA est en cours échoue ou se fait refuser.
+        timeout=None → MIGRATE_TIMEOUT lu À L'APPEL (cf. wait_ha_settled).
         NB : le choix des cibles revient au CRM (règles d'affinité) ; une
         migration manuelle vers une cible arbitraire serait rejetée avec
         « not allowed on target node »."""
+        if timeout is None:
+            timeout = MIGRATE_TIMEOUT
         t0 = time.time()
         while time.time() - t0 < timeout:
             lst = self.with_api(lambda p: p.cluster.ha.resources.get())
@@ -3036,26 +3070,70 @@ class ProxmoxClient:
         self._vm_local_disks[key] = res
         return res
 
-    def migrate_vm(self, node: str, vmid: int, target: str, vmtype: str):
+    def vm_onboot(self, node: str, vmid: int, vmtype: str) -> Optional[bool]:
+        """Option « start at boot » (onboot) d'un guest : True si onboot=1,
+        False si 0 ou ABSENT (défaut PVE : pas de démarrage auto), None si
+        la config est illisible. Pourquoi ça compte : tant qu'un guest
+        est géré par le HA (ressource NON 'ignored'), onboot est SANS
+        effet (seul l'état demandé à la ressource compte) ; mais dès
+        que la ressource est détachée ('ignored'), le HA ne le gère
+        plus et 'pve-guests' applique onboot au boot du nœud. Laisser
+        sur place une VM stopped avec onboot=1 pendant un upgrade la
+        ferait DÉMARRER au retour du nœud, puis ÉTEINDRE par le CRM à
+        la réactivation de sa ressource dans l'état d'origine
+        ('stopped' = état demandé, le CRM l'impose). Mémoïsé par
+        (vmtype, vmid)."""
+        key = (vmtype, vmid)
+        if key in self._vm_onboot:
+            return self._vm_onboot[key]
+        res: Optional[bool] = None
+        try:
+            cfg = (self.with_api(
+                       lambda p: p.nodes(node).lxc(vmid).config.get())
+                   if vmtype == "lxc" else
+                   self.with_api(
+                       lambda p: p.nodes(node).qemu(vmid).config.get()))
+            val = (cfg or {}).get("onboot", "0")
+            res = str(val).strip() == "1"
+        except Exception:
+            res = None
+        self._vm_onboot[key] = res
+        return res
+
+    def migrate_vm(self, node: str, vmid: int, target: str, vmtype: str,
+                   timeout: Optional[int] = None):
         """Migration d'un guest. QEMU : live migration (zéro downtime).
         LXC : PAS de live migration possible — on utilise le mode 'restart'
         (arrêt, transfert, redémarrage sur la cible : downtime de quelques
-        secondes/minutes selon le stockage)."""
+        secondes/minutes selon le stockage).
+        timeout : timeout EFFECTIF d'attente de la tâche (live QEMU :
+        adapté à la taille de la VM par _migrate_timeout_for ; sinon
+        PVE_MIGRATE_TIMEOUT)."""
         if vmtype == "lxc":
             self.log.info(f"Migration du CT {vmid} : {node} ➔ {target} "
                           f"(mode restart : ARRET/REDÉMARRAGE, downtime court)")
             task = self.with_api(lambda p: p.nodes(node).lxc(vmid).migrate.post(
                 target=target, restart=1))
+            self._wait_task(node, task)
         else:
-            self.log.info(f"Live migration de la VM {vmid} : {node} ➔ {target}")
+            t = timeout or MIGRATE_TIMEOUT
+            self.log.info(f"Live migration de la VM {vmid} : {node} ➔ {target} "
+                          f"(timeout {t}s)")
             kwargs = {"target": target, "online": 1}
             if WITH_LOCAL_DISKS:
                 # disques locaux inclus dans la migration (storage non partagé)
                 kwargs["with-local-disks"] = 1
             task = self.with_api(lambda p: p.nodes(node).qemu(vmid).migrate.post(**kwargs))
-        self._wait_task(node, task)
+            self._wait_task(node, task, timeout=t)
 
-    def _wait_task(self, node: str, upid: str, timeout: int = MIGRATE_TIMEOUT):
+    def _wait_task(self, node: str, upid: str,
+                   timeout: Optional[int] = None):
+        """Attend la fin d'une tâche Proxmox. timeout=None → MIGRATE_TIMEOUT
+        lu AU MOMENT DE L'APPEL (le paramètre par défaut d'une fonction est
+        évalué à l'import : une valeur PVE_MIGRATE_TIMEOUT posée dans le
+        --env-file doit rester effective après la relecture de main())."""
+        if timeout is None:
+            timeout = MIGRATE_TIMEOUT
         t0 = time.time()
         last_beat = 0
         while time.time() - t0 < timeout:
@@ -3074,7 +3152,26 @@ class ProxmoxClient:
                     return
                 raise RuntimeError(f"Tâche {upid} échouée : {st.get('exitstatus')}")
             time.sleep(5)
-        raise RuntimeError(f"Timeout ({timeout}s) sur la tâche {upid}")
+        # Timeout : l'attente est purement CLIENTE — la tâche peut TOUJOURS
+        # tourner côté Proxmox. Pour une live migration, la laisser finir
+        # en pleine remise en état HA est une course dangereuse (le CRM
+        # reprend la main sur une VM en cours de déplacement). On ANNULE
+        # donc proprement la tâche côté Proxmox : une qmigrate annulée
+        # laisse la VM SUR SON NŒUD SOURCE, sans perte ni interruption —
+        # état cohérent pour la sortie de maintenance et le CRM. L'annula-
+        # tion est BEST-EFFORT (tâche déjà finie, API injoignable…) : elle
+        # ne masque JAMAIS le timeout d'origine.
+        try:
+            self.with_api(lambda p: p.nodes(node).tasks(upid).cancel.post())
+            self.log.warning(f"  … tâche {upid} : annulation demandée côté "
+                             f"Proxmox après timeout — la VM (le cas échéant) "
+                             f"reste sur son nœud source, sans interruption")
+        except Exception:
+            self.log.warning(f"  … tâche {upid} : annulation impossible "
+                             f"(déjà terminée ou API injoignable) — VÉRIFIER "
+                             f"son issue côté Proxmox avant tout relancement")
+        raise RuntimeError(
+            f"Timeout ({timeout}s) sur la tâche {upid}")
 
     def apt_update(self, node: str):
         self.log.info(f"{node}: apt update (rafraîchissement des listes)…")
@@ -3768,7 +3865,15 @@ class Updater:
             else:
                 if not self.dry and migrate:
                     _t_mig = time.time()
-                    self.client.migrate_vm(p["from"], real.vmid, tgt, real.vmtype)
+                    # timeout adapté : live QEMU d'une VM running uniquement
+                    # (une VM stopped migre sa config en quelques secondes ;
+                    # un CT restart copie des disques, non modélisé ici —
+                    # plancher PVE_MIGRATE_TIMEOUT dans les deux cas).
+                    _mig_to = (None if (real.vmtype == "lxc"
+                                        or real.status != "running")
+                               else _migrate_timeout_for(vm_load(real)))
+                    self.client.migrate_vm(p["from"], real.vmid, tgt,
+                                          real.vmtype, timeout=_mig_to)
                     self.touched = True
                     # diagnostic post-migration : la VM a-t-elle survécu ?
                     # (guest agent si présente, sinon qmpstatus/qemu ;
@@ -3880,6 +3985,69 @@ class Updater:
             f"(PGs dégradées non reconstruites).")
 
     # ---------- étapes ----------
+    def _stopped_to_leave(self, state: ClusterState, node: str) -> List[VmInfo]:
+        """VMs stopped à LAISSER SUR PLACE pendant le traitement du nœud
+        (aucune migration) : une VM éteinte ne court AUCUN risque pendant
+        l'upgrade et le reboot, et sa migration ne gagne rien — déplacement
+        de config sur stockage partagé, copie COMPLÈTE des disques sur
+        stockage local. La ressource HA d'une stopped reste détachée
+        ('ignored') comme les autres : sinon le mode maintenance la
+        relocaliserait ; elle est réactivée dans son état d'origine
+        ('stopped') en fin de traitement, sans churn (une ressource
+        stopped reste stopped au retour du nœud).
+        GARDE-FOU OBLIGATOIRE — 'onboot' : une VM stopped avec onboot=1
+        (ou de config illisible — conservateur) est MIGRÉE comme avant :
+        laissée sur place, elle DÉMARRERAIT au boot du nœud au retour
+        d'upgrade (plus gérée par le HA en 'ignored'), puis serait
+        ÉTEINTE par le CRM à la réactivation de sa ressource ('stopped'
+        = état demandé, le CRM l'impose).
+        En dry-run : seules les VMs réellement SUR le nœud (placement
+        réel, pas simulé) sont candidates — l'état simulé a pu y
+        déplacer des stopped lors des nœuds précédents."""
+        src = state.nodes[node]
+        stopped = [v for v in src.vms if v.status == "stopped"]
+        if not stopped:
+            return []
+        real_nodes: Dict[int, str] = {}
+        if self.dry:
+            try:
+                for r in self.client.with_api(
+                        lambda p: p.cluster.resources.get()):
+                    if (r.get("type") in ("qemu", "lxc")
+                            and r.get("vmid") is not None):
+                        try:
+                            real_nodes[int(r.get("vmid"))] = r.get("node", "")
+                        except (TypeError, ValueError):
+                            continue
+            except Exception as e:
+                self.log.warning(
+                    f"  Placement réel des guests illisible ({e}) : les "
+                    f"VMs stopped sont migrées comme avant (conservateur).")
+                return []
+        leave: List[VmInfo] = []
+        for v in stopped:
+            if self.dry and real_nodes.get(v.vmid) != node:
+                # artefact de simulation (stopped planifiée ICI par un
+                # nœud précédent) : elle n'est pas réellement sur le
+                # nœud — comportement inchangé, elle est migrée.
+                continue
+            onboot = self.client.vm_onboot(node, v.vmid, v.vmtype)
+            if onboot is None:
+                self.log.warning(
+                    f"  {v} : stopped mais option 'onboot' illisible — "
+                    f"MIGRÉE (conservateur : la laisser serait risqué "
+                    f"si elle démarrait au boot du nœud).")
+                continue
+            if onboot:
+                self.log.warning(
+                    f"  {v} : stopped avec onboot=1 — MIGRÉE (laissée "
+                    f"sur place, elle partirait au boot du nœud au "
+                    f"retour d'upgrade, puis le CRM l'éteindrait à la "
+                    f"réactivation de sa ressource 'stopped').")
+                continue
+            leave.append(v)
+        return leave
+
     def preflight(self):
         banner(self.log, "ÉTAPE 0 — Pré-vérifications du cluster")
         # Les pré-vérifications sont de PURE LECTURE (quorum, versions PVE,
@@ -4086,10 +4254,21 @@ class Updater:
         src = state.nodes[node]
         ha_vms_here = [v for v in src.vms if v.vmid in ha_vmids]
         other_plans: List[Dict] = []
+        # VMs stopped « laissées sur place » (garde-fou onboot appliqué,
+        # avertissements émis par le helper) : exclues du plan, elles
+        # restent sur le nœud pendant l'upgrade/reboot sans aucun risque.
+        leave = self._stopped_to_leave(state, node)
+        leave_ids = {v.vmid for v in leave}
+        # stopped HA laissées sur place : détachées/réactivées comme les
+        # autres (le mode maintenance relocaliserait leur entrée ressource)
+        ha_left = [v for v in leave if v.vmid in ha_vmids]
 
         if self.dry:
             # ===== simulation : plan complet, VMs HA marquées =====
             sim = state.clone()
+            if leave_ids:
+                sim.nodes[node].vms = [v for v in sim.nodes[node].vms
+                                       if v.vmid not in leave_ids]
             all_plans = plan_migrations(sim, sim.nodes[node], self.log)
             ha_plans = [p for p in all_plans if p["vm"].vmid in ha_vmids]
             other_plans = [p for p in all_plans if p["vm"].vmid not in ha_vmids]
@@ -4102,32 +4281,39 @@ class Updater:
                                  ha_affinity=state.ha_affinity,
                                  ha_affinity_hard=state.ha_affinity_hard)
             # résumé explicite : qui est HA (donc détachée) et qui ne l'est pas
-            if ha_plans:
-                ha_desc = (f"{len(ha_plans)} ressource HA à détacher"
-                           if len(ha_plans) == 1 else
-                           f"{len(ha_plans)} ressources HA à détacher")
+            n_detach = len(ha_plans) + len(ha_left)
+            if n_detach:
+                ha_desc = (f"{n_detach} ressource HA à détacher"
+                           if n_detach == 1 else
+                           f"{n_detach} ressources HA à détacher")
+                ids = ([str(p["vm"].vmid) for p in ha_plans]
+                       + [str(v.vmid) for v in ha_left])
                 self.log.info(f"  Résumé : {len(all_plans)} guest(s) à "
                               f"migrer dont {ha_desc} en 'ignored' ("
-                              + ", ".join(str(p["vm"].vmid) for p in ha_plans)
+                              + ", ".join(ids)
                               + f") et {len(other_plans)} guest(s) sans HA.")
             else:
                 self.log.info(f"  Résumé : {len(all_plans)} guest(s) à "
                               f"migrer — AUCUNE ressource HA sur {node}, "
                               f"rien à détacher.")
+            if leave:
+                self.log.info(
+                    f"  Stopped laissées sur place (aucune migration — "
+                    f"elles ne courent aucun risque, reboot inclus) : "
+                    + ", ".join(str(v) for v in leave))
             # mémoriser l'évacuation pour un éventuel rapatriement (--node)
             self.evacuated[node] = all_plans
 
             # ===== 2a) détachement HA — UNIQUEMENT s'il y a des HA =====
-            if ha_plans:
+            if ha_plans or ha_left:
                 self.log.info(f"[SIMULATION] 2a) Détachement HA : état "
                               f"'ignored' + label {PRU_LABEL} dans le "
                               f"comment — le CRM ne les gère plus")
-                for p in ha_plans:
-                    sid = self.client.ha_sids().get(p["vm"].vmid,
-                                                     f"vm:{p['vm'].vmid}")
+                for v in [p["vm"] for p in ha_plans] + ha_left:
+                    sid = self.client.ha_sids().get(v.vmid, f"vm:{v.vmid}")
                     orig = self.client.ha_resource_snapshot(sid)
                     self.log.info(f"[SIMULATION] 2a)    {sid} "
-                                  f"({p['vm'].name}) : {orig['state']} → "
+                                  f"({v.name}) : {orig['state']} → "
                                   f"ignored (état d'origine mémorisé)")
             else:
                 self.log.info(f"[SIMULATION] 2a) Aucune ressource HA sur "
@@ -4195,7 +4381,9 @@ class Updater:
             state.nodes[node].mem = 0
             state.nodes[node].cpu = 0.0
             print_occupancy_table(self.log, state,
-                                  f"ÉTAT SIMULÉ APRÈS MIGRATION — {node} vidé",
+                                  f"ÉTAT SIMULÉ APRÈS MIGRATION — {node} vidé"
+                                  + (" (hors stopped laissées sur place)"
+                                     if leave else ""),
                                   highlight=node, plans=all_plans)
 
             # ===== PHASE 2 : UPGRADE SYSTÈME (sans lien avec les plans) =====
@@ -4230,27 +4418,28 @@ class Updater:
             self.est_clock += add
             self.est_node_time += add
             self.est_maint_nodes += 1
-            if ha_plans:
-                detached = (f"{len(ha_plans)} ressource HA détachée"
-                            if len(ha_plans) == 1 else
-                            f"{len(ha_plans)} ressources HA détachées")
+            if ha_plans or ha_left:
+                detached = (f"{len(ha_plans) + len(ha_left)} ressource HA détachée"
+                            if len(ha_plans) + len(ha_left) == 1 else
+                            f"{len(ha_plans) + len(ha_left)} ressources HA détachées")
                 self.log.info(f"[SIMULATION] 2g) Sortie de maintenance de "
                               f"{node} + réactivation des {detached} "
                               f"dans leur état d'origine (comment "
                               f"restauré) + fenêtre de stabilité CRM 60s")
-                for p in ha_plans:
-                    sid = self.client.ha_sids().get(p["vm"].vmid,
-                                                     f"vm:{p['vm'].vmid}")
+                for v in [p["vm"] for p in ha_plans] + ha_left:
+                    sid = self.client.ha_sids().get(v.vmid, f"vm:{v.vmid}")
                     orig = self.client.ha_resource_snapshot(sid)
-                    if p.get("off_rule"):
+                    off = any(p.get("off_rule") for p in ha_plans
+                              if p["vm"].vmid == v.vmid)
+                    if off:
                         self.log.info(
                             f"[SIMULATION] 2g)    {sid} "
-                            f"({p['vm'].name}) : réactivation DIFFÉRÉE "
+                            f"({v.name}) : réactivation DIFFÉRÉE "
                             f"(repli hors règle strict=0) — reste "
                             f"'ignored' jusqu'à la fin du run")
                     else:
                         self.log.info(f"[SIMULATION] 2g)    {sid} "
-                                      f"({p['vm'].name}) : ignored → "
+                                      f"({v.name}) : ignored → "
                                       f"{orig['state']} (comment d'origine "
                                       f"restauré)")
             else:
@@ -4329,10 +4518,15 @@ class Updater:
         src.in_maintenance = True
 
         try:
-            # 2c) plan puis migrations réelles de TOUTES les VMs :
-            # les ressources HA sont 'ignored', le script peut les
-            # déplacer comme des VMs ordinaires (qm migrate live).
+            # 2c) plan puis migrations réelles : les ressources HA sont
+            # 'ignored', le script peut les déplacer comme des VMs
+            # ordinaires (qm migrate live) ; les VMs stopped « laissées
+            # sur place » (garde-fou onboot appliqué) sont EXCLUES du
+            # plan — elles restent sur le nœud pendant l'upgrade/reboot.
             sim = state.clone()
+            if leave_ids:
+                sim.nodes[node].vms = [v for v in sim.nodes[node].vms
+                                       if v.vmid not in leave_ids]
             plans = plan_migrations(sim, sim.nodes[node], self.log)
             plan_title = (f"PLAN DE MIGRATION — vider {node} "
                           f"(dont {len(ha_vms_here)} "
@@ -4345,6 +4539,11 @@ class Updater:
                                  ha_vmids=state.ha_vmids,
                                  ha_affinity=state.ha_affinity,
                                  ha_affinity_hard=state.ha_affinity_hard)
+            if leave:
+                self.log.info(
+                    f"  Stopped laissées sur place (aucune migration — "
+                    f"elles ne courent aucun risque, reboot inclus) : "
+                    + ", ".join(str(v) for v in leave))
             self.evacuated[node] = plans
             for p in plans:
                 if p.get("off_rule"):
@@ -4355,7 +4554,9 @@ class Updater:
             # occupation APRÈS les migrations : preuve que le nœud est
             # vidé avant de toucher au système
             print_occupancy_table(self.log, state,
-                                  f"OCCUPATIONS — après migration ({node} vidé)",
+                                  f"OCCUPATIONS — après migration ({node} vidé"
+                                  + (", hors stopped laissées sur place)"
+                                     if leave else ")"),
                                   highlight=node, plans=plans)
 
             # ===== PHASE 2 : UPGRADE SYSTÈME (dissociée de l'évacuation) =====
@@ -5486,6 +5687,7 @@ def main():
     global EST_MIGRATE_SPEED, EST_MIGRATE_OVERHEAD_S
     global EST_APT_MIN, EST_UPGRADE_MIN, EST_REBOOT_MIN
     global STATS_FILE, STATS_MAX_SAMPLES
+    global MIGRATE_TIMEOUT
     API_HOST = _env("PVE_API_HOST", API_HOST)
     # PVE_API_HOSTS et PVE_EST_* : relus APRÈS le fichier d'env comme les
     # autres — sinon une valeur posée UNIQUEMENT dans ce fichier serait
@@ -5501,6 +5703,12 @@ def main():
     STATS_FILE = _env("PVE_STATS_FILE", STATS_FILE)
     STATS_MAX_SAMPLES = int(_env("PVE_STATS_MAX_SAMPLES",
                                  str(STATS_MAX_SAMPLES)))
+    # MIGRATE_TIMEOUT est un _env au niveau module : relecture ici pour
+    # qu'une valeur posée UNIQUEMENT dans le --env-file prenne effet
+    # (le timeout par défaut d'un argument de fonction aurait capturé
+    # la valeur d'import, avant chargement du fichier env).
+    MIGRATE_TIMEOUT = int(_env("PVE_MIGRATE_TIMEOUT",
+                               str(MIGRATE_TIMEOUT)))
     derived = stats_derive(load_stats())
     EST_PROV.clear()
     EST_MIGRATE_SPEED = int(_env(
