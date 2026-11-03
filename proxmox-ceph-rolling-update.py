@@ -22,8 +22,12 @@ Trois actions MUTUELLEMENT EXCLUSIVES :
      les nœuds, apt full-upgrade sur tous les nœuds (les binaires
      nouveaux sont installés mais les anciens tournent encore), PUIS
      passes de redémarrage PAR TYPE DE DAEMON : mons un par un →
-     vérification min_mon_release → mgrs → OSDs nœud par nœud → MDS
-     (procédure max_mds) → vérification que TOUTES les OSDs tournent
+     vérification min_mon_release → mgrs → OSDs UNE PAR UNE (arrêt →
+     test du sharding RocksDB réel pendant l'arrêt, « ceph-bluestore-
+     tool show-sharding » → démarrage sur les nouveaux binaires ;
+     équivalent plus progressif du restart ceph-osd.target par nœud)
+     → MDS (procédure max_mds) → vérification que TOUTES les OSDs
+     tournent
      sur la nouvelle release → « ceph osd require-osd-release » →
      retrait des flags de maintenance.
 
@@ -175,6 +179,14 @@ MAJOR_PREREQS = {
 
 # Version Ceph MINIMALE qui corrige CVE-2025-30156, par branche.
 CVE_FIXED = {"19": (19, 2, 6), "20": (20, 2, 4)}
+
+# Sharding RocksDB par défaut depuis Pacific (v16, GA avril 2021) : les
+# OSDs créées AVANT (Octopus v15 et antérieures) sont NON shardées →
+# piège META du wiki Squid→Tentacle (hausse d'usage RocksDB après la
+# montée, jusqu'à 20.2.4). Le sharding réel ne se vérifie qu'OSD
+# ARRÊTÉE (ceph-bluestore-tool show-sharding) : la préflight utilise
+# l'heuristique non invasive de la date de création des répertoires.
+PACIFIC_DEFAULT_SHARDING_TS = 1617235200  # 2021-04-01 00:00:00 UTC
 
 # Noyau Linux minimum pour les clients noyau (CephFS/RBD in-guest) :
 # support des clés aes256k depuis Linux 7.0 (clients utilisateurs : vérifiez
@@ -964,6 +976,39 @@ class ProxmoxClient:
             pass
         return ()
 
+    def osd_dirs_info(self, node: str) -> Dict[int, Tuple[str, float]]:
+        """Répertoire de données + date de naissance (birth, fallback
+        mtime) de chaque OSD du nœud : {osd_id: (path, ts)}. Le path
+        sert au test RÉEL du sharding RocksDB (ceph-bluestore-tool
+        show-sharding, OSD arrêtée), la date à l'heuristique du piège
+        META du wiki. Lecture pure, sans risque."""
+        out = self._ssh(
+            node, "stat -c '%n|%W|%Y' /var/lib/ceph/osd/* 2>/dev/null")
+        res: Dict[int, Tuple[str, float]] = {}
+        for ln in out.splitlines():
+            parts = ln.strip().split("|")
+            if len(parts) != 3:
+                continue
+            m = re.search(r"(\d+)$", parts[0])
+            if not m:
+                continue
+            try:
+                birth = float(parts[1])
+                mtime = float(parts[2])
+            except ValueError:
+                continue
+            # %W = 0 quand le FS ne fournit pas le birth time (ex. ZFS)
+            res[int(m.group(1))] = (parts[0], birth or mtime)
+        return res
+
+    def osd_dir_birthdays(self, node: str) -> Dict[int, float]:
+        """Date de naissance de chaque OSD du nœud, en secondes epoch :
+        {osd_id: ts}. Heuristique non invasive pour le piège META du
+        wiki : le sharding RocksDB réel ne se vérifie qu'OSD ARRÊTÉE
+        (ceph-bluestore-tool show-sharding)."""
+        return {oid: ts for oid, (_p, ts)
+                in self.osd_dirs_info(node).items()}
+
     def ceph_repo_branch(self, node: str) -> str:
         """Branche du dépôt Ceph configurée sur le nœud (ex. squid)."""
         try:
@@ -1171,6 +1216,11 @@ class CephUpdater:
         # répertoires pour 53 OSD). Nœuds déjà signalés (anti-doublon).
         self._osd_tree: Dict[str, List[int]] = {}
         self._stale_warned: set = set()
+        # Vérité terrain du sharding RocksDB (Phase E de --major) :
+        # OSDs détectées NON shardées (show-sharding pendant l'arrêt)
+        # et nombre de tests réussis — récapitulés au bilan final.
+        self._nonsharded: List[str] = []
+        self._shard_probed: int = 0
 
     # ---------------- Fichier d'état ----------------
     def _state_read(self) -> Dict:
@@ -1405,13 +1455,10 @@ class CephUpdater:
             self._major_target_sanity(rel, num)
             # Garde 2 — prérequis de la release cible (wiki officiel) :
             self._major_prereqs(rel, num)
-            # Piège connu du wiki (OSDs créées sous Octopus ou avant) :
-            self.log.warning(
-                "Piège connu du wiki : des OSDs créées sous Octopus (v15) "
-                "ou avant peuvent voir leur usage META (RocksDB non "
-                "shardé) fortement augmenter APRÈS la montée — vérifiez "
-                "« ceph osd df » (colonne META) après le run ; "
-                "contournement : « ceph daemon osd.N compact » un par un.")
+            # Piège META du wiki (Known Issues) : WARNING ciblé seulement
+            # si des OSDs datent d'avant Pacific (v16, sharding par
+            # défaut) — pas d'avertissement générique.
+            self._major_octopus_check()
             self.log.info(f"Action MAJEURE : bascule vers Ceph {rel} "
                           f"(major {num}). Procédure officielle Proxmox : "
                           f"dépôt sur tous les nœuds → paquets sur tous "
@@ -1470,6 +1517,10 @@ class CephUpdater:
             self.log.info(
                 f"Cluster déjà sur {cur} — le run bascule/sécurise les "
                 f"éléments restants (dépôt, paquets, min_mon_release…).")
+        else:
+            self.log.info(f"Montée {cur} (major {cur_num}) → {rel} "
+                          f"(major {num}) : exactement une release majeure "
+                          f"(N+1) ✔")
 
     def _major_prereqs(self, rel: str, num: int) -> None:
         """Prérequis de la release cible (wiki officiel), par nœud :
@@ -1512,6 +1563,61 @@ class CephUpdater:
                         f"{node} : pve-manager {pve_txt} < minimum requis "
                         f"{pv_txt} pour la montée vers {rel} (wiki) — "
                         f"terminez d'abord le rolling update PVE.")
+
+    def _major_octopus_check(self) -> None:
+        """Piège META du wiki (Known Issues, Squid→Tentacle) : les OSDs
+        créées sous Octopus (v15) ou avant ont un RocksDB NON shardé
+        (sharding par défaut seulement depuis Pacific, v16) et voient
+        leur usage META augmenter après la montée (jusqu'à 20.2.4).
+        Le sharding réel ne se vérifie qu'OSD ARRÊTÉE : heuristique non
+        invasive = date de création du répertoire de données de l'OSD.
+        WARNING ciblé seulement dans ce cas ; INFO discret sinon."""
+        old: List[str] = []
+        probed = 0
+        for node in self.nodes:
+            ids = self._osd_tree.get(node)
+            if ids is None:
+                ids = [int(o) for o in self.client.node_daemons(node)["osd"]
+                       if str(o).lstrip("-").isdigit()]
+            if not ids:
+                continue
+            try:
+                bdays = self.client.osd_dir_birthdays(node)
+            except Exception:
+                bdays = {}
+            probed += len(bdays)
+            for oid in ids:
+                ts = bdays.get(int(oid))
+                if ts and ts < PACIFIC_DEFAULT_SHARDING_TS:
+                    when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                    old.append(f"osd.{oid} ({node}, {when})")
+        if old:
+            shown = ", ".join(old[:10]) + ("…" if len(old) > 10 else "")
+            self.log.warning(
+                f"Piège du wiki (Known Issues) : {len(old)} OSD(s) "
+                f"datent d'avant Pacific (v16) — RocksDB probablement "
+                f"NON shardé : {shown}. Après la montée, surveillez "
+                f"« ceph osd df » (colonne META ; un Total Space en "
+                f"baisse dans l'UI PVE est un autre symptôme) ; "
+                f"contournement : « ceph daemon osd.N compact » un par "
+                f"un (I/O intensif, heures creuses). Le run réel "
+                f"testera le sharding de CHAQUE OSD automatiquement "
+                f"pendant la Phase E (arrêt → show-sharding → "
+                f"démarrage) — récapitulatif au bilan.")
+        elif probed:
+            self.log.info(
+                f"Aucune OSD antérieure à Pacific (v16) détectée (date "
+                f"de création des répertoires de {probed} OSD(s)) — le "
+                f"piège META du wiki ne s'applique pas.")
+        else:
+            self.log.warning(
+                "Dates de création des OSDs illisibles — impossible "
+                "d'exclure le piège META du wiki (OSDs créées sous "
+                "Octopus v15 ou avant, RocksDB non shardé) : vérifiez "
+                "« ceph osd df » (colonne META) après la montée ; "
+                "contournement : « ceph daemon osd.N compact ». Le run "
+                "réel testera le sharding de chaque OSD en Phase E — "
+                "récapitulatif au bilan.")
 
     def _rotate_keys_preflight(self, st: Dict) -> bool:
         """Gates propres à la remédiation CVE-2025-30156. Retourne False
@@ -1765,18 +1871,25 @@ class CephUpdater:
                                         "redémarrages — « ceph mgr dump » "
                                         "pour diagnostiquer.")
                 self.log.info(f"mgr actif : {dump['active_name']} ✔")
-        # ---- Phase E : OSDs nœud par nœud ----
-        banner(self.log, "PHASE E — Redémarrage des OSDs nœud par nœud "
-                         "(jamais deux nœuds à la fois)")
+        # ---- Phase E : OSDs une par une, nœud par nœud ----
+        banner(self.log, "PHASE E — Mise à jour des OSDs UNE PAR UNE "
+                         "(nœud par nœud ; arrêt → test du sharding réel "
+                         "→ démarrage sur les nouveaux binaires)")
         for node in self.nodes:
-            osds = self.client.node_daemons(node)["osd"]
-            if not osds:
+            ids = self._osd_tree.get(node)
+            if ids is None:
+                ids = [int(o) for o in self.client.node_daemons(node)["osd"]
+                       if str(o).lstrip("-").isdigit()]
+            if not ids:
                 continue
-            self._mut("systemctl restart ceph-osd.target", node=node,
-                      desc=f"redémarrage des {len(osds)} OSD(s) de {node}")
-            self.counts["restarts"] += 1
-            self._est(EST_RESTART_OSD_S)
-            self._gate(f"restart des OSDs de {node}", node=node)
+            try:
+                dirs = {oid: p for oid, (p, _ts)
+                        in self.client.osd_dirs_info(node).items()}
+            except Exception:
+                dirs = {}
+            for oid in sorted(int(i) for i in ids):
+                self._osd_upgrade_one(node, oid, dirs.get(oid),
+                                       len(ids))
         # ---- Phase F : MDS (AVANT require-osd-release, comme le wiki) ----
         self._major_mds()
         # ---- Phase G : version minimale des OSDs ----
@@ -1810,6 +1923,72 @@ class CephUpdater:
         self._mut(f"ceph osd require-osd-release {rel}",
                   desc="version minimale des OSDs")
 
+    def _osd_upgrade_one(self, node: str, oid: int, path: Optional[str],
+                         per_node: int) -> None:
+        """Cycle d'UNE OSD en montée majeure : arrêt → lecture du
+        sharding RocksDB RÉEL pendant l'arrêt (piège META du wiki,
+        ceph-bluestore-tool show-sharding — lecture pure) → démarrage
+        sur les nouveaux binaires → gate. Équivalent, plus progressif,
+        du « systemctl restart ceph-osd.target » du wiki : une seule
+        OSD down à la fois, et la vérité terrain du sharding en prime."""
+        try:
+            self._mut(f"systemctl stop ceph-osd@{oid}", node=node,
+                      desc=f"arrêt de osd.{oid}")
+        except Exception:
+            # Arrêt incertain : démarrage de secours best-effort, puis
+            # abort propre (gate jamais passée → finally retire les flags).
+            try:
+                self._mut(f"systemctl start ceph-osd@{oid}", node=node,
+                          desc=f"démarrage de secours de osd.{oid}")
+            except Exception:
+                pass
+            raise
+        self._shard_probe(node, oid, path)
+        self._mut(f"systemctl start ceph-osd@{oid}", node=node,
+                  desc=f"démarrage de osd.{oid} sur les nouveaux binaires")
+        self.counts["restarts"] += 1
+        self._est(EST_RESTART_OSD_S / max(1, per_node))
+        self._gate(f"restart osd.{oid} ({node})", node=node)
+
+    def _shard_probe(self, node: str, oid: int,
+                     path: Optional[str]) -> None:
+        """Test du sharding RocksDB réel pendant l'arrêt de l'OSD :
+        « ceph-bluestore-tool show-sharding --path <dir> ». OSD NON
+        shardée (créée sous Octopus v15 ou avant) → « failed to
+        retrieve sharding def » ; shardée → un sharding-def (m(3)
+        p(3,0-12) …). Lecture pure : un échec quelconque (outil
+        absent, chemin introuvable, sortie illisible) ne bloque
+        JAMAIS la montée — l'OSD redémarre toujours."""
+        label = path or f"<répertoire de osd.{oid}>"
+        if self.dry:
+            self._sim(f"test du sharding réel de osd.{oid} pendant "
+                      f"l'arrêt : « ceph-bluestore-tool show-sharding "
+                      f"--path {label} » (lecture pure)")
+            return
+        if not path:
+            self.log.info(f"osd.{oid} : répertoire de données "
+                          f"introuvable — test du sharding sauté "
+                          f"(pas bloquant).")
+            return
+        try:
+            out = self.client.ceph_run(
+                f"ceph-bluestore-tool show-sharding --path {path}",
+                node=node)
+        except Exception as exc:
+            self.log.warning(f"osd.{oid} : test du sharding impossible "
+                             f"({exc}) — pas bloquant.")
+            return
+        txt = (out or "").strip()
+        self._shard_probed += 1
+        if "failed to retrieve sharding def" in txt.lower():
+            self._nonsharded.append(f"osd.{oid} ({node})")
+            self.log.warning(
+                f"osd.{oid} : RocksDB NON shardé (show-sharding) — "
+                f"usage META à surveiller après la montée "
+                f"(récapitulatif au bilan).")
+        elif txt:
+            self.log.info(f"osd.{oid} : RocksDB shardé ✔ (show-sharding)")
+
     def _major_mds(self) -> None:
         """Procédure MDS du wiki Proxmox : standby_replay off, max_mds→1,
         attente des ranks, arrêt des standbys, restart du dernier actif,
@@ -1826,12 +2005,22 @@ class CephUpdater:
         orig: Dict[str, Tuple[int, str]] = {}
         for fs in fs_list:
             max_mds, asr = 1, "false"
-            if not self.dry:
+            try:
+                # Lecture PURE : faite aussi en dry-run pour une
+                # simulation fidèle (réduction/restauration montrées
+                # si max_mds > 1 ou standby_replay actif).
                 out = self.client.ceph_run(f"ceph fs get {fs}")
-                m = re.search(r"max_mds\s+(\d+)", out)
-                max_mds = int(m.group(1)) if m else 1
-                asr = "true" if re.search(r"allow_standby_replay\s+true",
-                                          out) else "false"
+            except Exception as e:
+                if not self.dry:
+                    raise
+                self.log.warning(
+                    f"{fs} : réglages MDS illisibles ({e}) — hypothèse "
+                    f"max_mds=1 / standby_replay=off pour la simulation.")
+                out = ""
+            m = re.search(r"max_mds\s+(\d+)", out)
+            max_mds = int(m.group(1)) if m else 1
+            asr = "true" if re.search(r"allow_standby_replay\s+true",
+                                      out) else "false"
             orig[fs] = (max_mds, asr)
             if asr == "true":
                 self._mut(f"ceph fs set {fs} allow_standby_replay false",
@@ -1861,14 +2050,15 @@ class CephUpdater:
                 self.log.warning("Attente de la désactivation des ranks "
                                  "MDS supplémentaires…")
                 time.sleep(CEPH_POLL_S)
-        # 3) nœud du/des MDS actifs (rank 0)
+        # 3) nœud du/des MDS actifs (rank 0) — lecture pure, aussi en
+        # dry-run pour une simulation fidèle : l'actif est le DERNIER
+        # à redémarrer (wiki).
         active_nodes: List[str] = []
-        if not self.dry:
-            st = self.client.ceph_status() or {}
-            for u in (st.get("mdsmap") or {}).get("up") or []:
-                name = str(u.get("name", "")).replace("mds.", "")
-                if name and name not in active_nodes:
-                    active_nodes.append(name)
+        st = self.client.ceph_status() or {}
+        for u in (st.get("mdsmap") or {}).get("up") or []:
+            name = str(u.get("name", "")).replace("mds.", "")
+            if name and name not in active_nodes:
+                active_nodes.append(name)
         # 4) arrêt des standbys, restart de l'actif, retour des standbys
         standby_nodes = [n for n in mds_nodes if n not in active_nodes]
         for node in standby_nodes:
@@ -1883,6 +2073,14 @@ class CephUpdater:
             self.counts["restarts"] += 1
             self._est(EST_RESTART_MDS_S)
             self._gate(f"restart MDS actif ({node})")
+        if self.dry and not active_nodes:
+            # simulation fidèle même sans actif lisible : l'étape du
+            # restart de l'actif (le DERNIER, wiki) doit apparaître.
+            self._sim(f"redémarrage du MDS actif — le DERNIER à tourner "
+                      f"sur {rel} (nœud déterminé au run réel via "
+                      f"« ceph status » → mdsmap.up)")
+            self.counts["restarts"] += 1
+            self._est(EST_RESTART_MDS_S)
         for node in standby_nodes:
             self._mut("systemctl start ceph-mds.target", node=node,
                       desc="retour du/de la MDS standby")
@@ -2494,6 +2692,14 @@ class CephUpdater:
         self.log.info(f"Santé Ceph : brute {raw}, effective {eff}"
                       + (f" ({len(ignored)} check(s) AUTH_INSECURE "
                          f"toléré(s))" if ignored else ""))
+        if ignored and self.action != "rotate-keys":
+            self.log.info(
+                "Rappel CVE-2025-30156 : ce cluster porte encore des clés "
+                "CephX « aes » (checks AUTH_INSECURE_* tolérés) — une fois "
+                "la version majeure en place, remédiez avec "
+                "« --execute --rotate-keys » (nécessite ≥ 19.2.6-pve3 en "
+                "squid, ≥ 20.2.4-pve3 en tentacle sur les MONs ; vérifiez "
+                "AUSSI les nœuds sans daemon (clients libs)).")
         if not self.dry:
             inc = self.client.insecure_entities()
             if inc:
@@ -2508,6 +2714,20 @@ class CephUpdater:
             inc = self._refresh_insecure() if self.action == "rotate-keys" else {}
             if self.action == "rotate-keys" and not inc:
                 self._sim("Bilan attendu : plus AUCUN check AUTH_INSECURE_*")
+        if self._nonsharded:
+            shown = ", ".join(self._nonsharded[:10]) + (
+                "…" if len(self._nonsharded) > 10 else "")
+            self.log.warning(
+                f"Vérité terrain (Phase E) : {len(self._nonsharded)} "
+                f"OSD(s) NON shardée(s) : {shown}. Piège META du wiki : "
+                f"surveillez « ceph osd df » (colonne META) dans les jours "
+                f"qui suivent la montée ; contournement : « ceph daemon "
+                f"osd.N compact » un par un (I/O intensif, heures creuses).")
+        elif self._shard_probed:
+            self.log.info(
+                f"Sharding RocksDB : {self._shard_probed} OSD(s) "
+                f"testée(s) pendant la Phase E — toutes shardées ✔ "
+                f"(piège META du wiki non applicable).")
         versions = self.client.ceph_versions()
         shown = False
         for t in ("mon", "mgr", "osd", "mds"):

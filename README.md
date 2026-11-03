@@ -11,8 +11,12 @@ Deux scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
   mineure par défaut, `--major RELEASE` (ex. tentacle 20.2 ; montée
   d'exactement une release — descente et saut refusés, prérequis
   pve-manager/ceph vérifiés, `require-osd-release` précédé de la
-  preuve que TOUTES les OSDs sont sur la nouvelle release) et
-  `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
+  preuve que TOUTES les OSDs sont sur la nouvelle release). En montée
+  majeure, les OSDs sont mises à jour UNE PAR UNE (arrêt → test réel
+  du sharding RocksDB via `ceph-bluestore-tool show-sharding` pendant
+  l'arrêt → démarrage sur les nouveaux binaires → gate) : vérité
+  terrain du piège META du wiki (OSDs créées sous Octopus), récapitulé
+  au bilan. Et `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
   re-détectées et sautées). Connexion SSH persistante par nœud
   (`PVE_SSH_RETRIES`), stderr capturé dans le fichier de log, bilan
   signalant explicitement les runs interrompus — voir son docstring.
