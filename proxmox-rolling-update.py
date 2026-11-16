@@ -36,6 +36,14 @@ Usage :
     python3 proxmox_rolling_update.py --execute --node pve-node3   # un seul nœud
 """
 
+# ---------------------------------------------------------------------------
+# VERSION DU SCRIPT — affichée EN PREMIER dans les logs de chaque run : c'est
+# la seule façon fiable de savoir QUELLE version tourne sur un cluster donné
+# (des copies périmées ont déjà été prises pour des versions à jour). À
+# incrémenter à CHAQUE publication.
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "13"
+
 import argparse
 import json
 import logging
@@ -156,6 +164,44 @@ MIGRATE_TIMEOUT_FACTOR = 2.0    # marge : timeout = max(plancher, FACTEUR ×
                                 # durée estimée par le modèle de débit)
 CEPH_TIMEOUT = 900              # secondes max d'attente d'un Ceph HEALTH_OK
 REBOOT_TIMEOUT = 900            # secondes max d'attente du retour d'un nœud
+
+# --- REMÉDIATION CEPH « MON_CLOCK_SKEW » (après reboot d'un nœud) ----
+# Après le reboot d'un nœud (upgrade noyau), Ceph passe couramment en
+# HEALTH_WARN : « mon.<nœud> clock skew 0.156993s > max 0.05s » — le mon
+# du nœud qui revient mesure une horloge encore décalée (RTC au boot,
+# chrony pas resynchronisé). Le warning part SEUL une fois l'horloge
+# d'aplomb (les mons ré-évaluent l'horloge au mon_timecheck_skew_
+# interval, 30 s par défaut), MAIS si chrony est lent ou coincé le run
+# reste bloqué à la gate HEALTH_OK pour un problème d'HORLOGE, bénin
+# pour le stockage. Remédiation AUTOMATIQUE, dans l'ordre (chaque
+# étape ne fait RIEN si l'horloge est déjà juste) :
+#   1) chrony inactif/désynchronisé sur le nœud coupable → restart
+#      chrony ;
+#   2) synchronisé mais offset > CLOCK_SKEW_MAX_S → chronyc makestep
+#      (saute l'heure immédiatement, sans toucher au service) ;
+#   3) attente de la ré-évaluation par les mons (le warning part seul) ;
+#   4) DERNIER RECOURS : restart ceph-mon@<nœud>, si (et seulement si)
+#      l'horloge est prouvée juste ET que le quorum garde la majorité
+#      STRICTE (refusé à 2 mons : sans majorité, tout le cluster fige
+#      ses IO). Désactivable via PVE_CEPH_CLOCK_MON_RESTART=0.
+# NB : ne JAMAIS relever « mon_clock_drift_allowed » (déconseillé par
+# la documentation Ceph) — le seuil de 0.05s protège le quorum des
+# mons. Prévention durable : « makestep 1.0 3 » dans chrony.conf.
+CLOCK_SKEW_MAX_S = float(_env("PVE_CEPH_CLOCK_SKEW_MAX_S", "0.05"))
+                                # seuil d'offset horloge déclenchant
+                                # makestep (= mon_clock_drift_allowed)
+CLOCK_CHRONY_TIMEOUT_S = int(_env("PVE_CEPH_CLOCK_CHRONY_TIMEOUT_S",
+                                  "120"))
+                                # attente max de resynchronisation
+                                # chrony après restart (poll 5 s)
+CLOCK_REEVAL_TIMEOUT_S = int(_env("PVE_CEPH_CLOCK_REEVAL_TIMEOUT_S",
+                                  "150"))
+                                # attente max de la ré-évaluation des
+                                # mons (~5 cycles de 30 s)
+CLOCK_MON_REJOIN_TIMEOUT_S = int(
+    _env("PVE_CEPH_CLOCK_MON_REJOIN_TIMEOUT_S", "180"))
+                                # attente max du retour au quorum du
+                                # mon redémarré (poll 5 s)
 
 # --- ESTIMATION DRY-RUN (bilan de fin : durée approximative du run,
 # volume de migrations, fenêtres de non-respect des anti-affinités
@@ -584,6 +630,18 @@ class ClusterState:
     # bilan de fin de dry-run : fenêtres de non-respect PAR règle) :
     # [{"id": <id règle>, "strict": bool, "members": [vmid, ...]}, ...]
     ha_rules_info: List[Dict] = field(default_factory=list)
+    # COMPATIBILITÉ QEMU/machine (v13) : une live migration est REFUSÉE
+    # par PVE si le nœud cible ne sait pas exécuter la machine de la VM
+    # (« Installed QEMU version '10.1.2' is too old to run machine type
+    # 'pc-i440fx-11.1+pve0', please upgrade node '…' » — vécu sur un
+    # cluster hétérogène). Rempli par la sonde qemu_compat_scan() à
+    # chaque fetch_state :
+    #   node_qemu : nœud ➔ version du binaire QEMU (« 10.1.2 »)
+    #   vm_machine : vmid ➔ machine EN COURS d'exécution
+    #               (« pc-i440fx-11.1+pve0 », RÉSOLUE au démarrage —
+    #               même quand la config porte l'alias « pc »)
+    node_qemu: Dict[str, str] = field(default_factory=dict)
+    vm_machine: Dict[int, str] = field(default_factory=dict)
     # Écart de pression RAM optimal approché, calculé au début du
     # rééquilibrage final (recherche locale) et réutilisé pour le seuil
     # AUTO et le verdict du rapport final. -1 = pas encore calculé.
@@ -609,7 +667,9 @@ class ClusterState:
                           ha_separate_hard={k: set(v) for k, v in
                                             self.ha_separate_hard.items()},
                           ha_rules_info=[{**ri, "members": list(ri["members"])}
-                                         for ri in self.ha_rules_info])
+                                         for ri in self.ha_rules_info],
+                          node_qemu=dict(self.node_qemu),
+                          vm_machine=dict(self.vm_machine))
         for name, n in self.nodes.items():
             nn = NodeInfo(n.name, n.maxmem, n.mem, n.maxcpu, n.cpu,
                           n.cpu_avg, n.mem_avg, n.status, n.in_maintenance, [])
@@ -667,14 +727,21 @@ def pressure_gap(state: ClusterState) -> Optional[float]:
 
 def print_occupancy_table(logger: logging.Logger, state: ClusterState, title: str,
                           highlight: Optional[str] = None,
-                          plans: Optional[List[Dict]] = None):
+                          plans: Optional[List[Dict]] = None,
+                          note: Optional[str] = None):
     """Vue arborescente unifiée du cluster : une ligne d'hyperviseur
     (RAM déclarée/consommée/libre/allouable + CPU + % + nb VMs + état)
     suivie de ses VMs en retrait (id, nom, RAM max, CPU, état, HA).
     Utilisée PARTOUT (état initial, avant/après chaque action, état
     final) pour un affichage homogène et facile à lire d'une traite.
-    highlight : nœud en cours de traitement (surbrillance cyan)."""
+    highlight : nœud en cours de traitement (surbrillance cyan).
+    note : ligne « NB : … » affichée juste SOUS le bandeau-titre (avant
+    les nœuds) pour poser la sémantique des métriques affichées (ex.
+    état initial : RAM réelle vs Σ déclarée ; état final simulé :
+    pression DÉCLARÉE du modèle, pas un usage mesuré)."""
     banner(logger, title, ColorFormatter.MAGENTA)
+    if note:
+        logger.info(f"  NB : {note}")
     # VMs qui viennent d'être déplacées (marqueur ◄ MIGRÉE) si l'appelant
     # fournit le plan appliqué (vues « après migration »).
     moved = {p["vm"].vmid: p["from"] for p in (plans or [])}
@@ -744,12 +811,16 @@ def print_occupancy_table(logger: logging.Logger, state: ClusterState, title: st
             head_cpu = 0.0
         cpu_txt = (f"~{head_cpu * 100:.0f}%" if n.cpu_avg
                    else f"{head_cpu * 100:.0f}%")
-        # Libellé selon la sémantique : « RAM » = consommation réelle de
-        # l'inventaire ; « RAM (pression) » = état interne MUTÉ (pire cas
-        # du modèle : Σ charges des running). L'égalité avec « Σ déclarée »
-        # en mode pression est STRUCTURELLE : un nœud vidé puis re-rempli
-        # ne reçoit que des charges de guests, d'où RAM == Σ déclarée.
-        ram_lbl = "RAM (pression)" if state.simulated else "RAM"
+        # Libellé selon la sémantique : « RAM réelle » = consommation
+        # mesurée de l'inventaire (moyenne 1h si dispo) ; « RAM
+        # (pression) » = état interne MUTÉ (pire cas du modèle : Σ
+        # charges des running). L'égalité avec « Σ déclarée » en mode
+        # pression est STRUCTURELLE : un nœud vidé puis re-rempli ne
+        # reçoit que des charges de guests, d'où RAM == Σ déclarée.
+        # (v9 : « RAM » devient « RAM réelle » à l'état initial —
+        # comparer sa consommation au « (pression) » DÉCLARÉ de l'état
+        # final simulé laissait croire que la mémoire du nœud gonflait.)
+        ram_lbl = "RAM (pression)" if state.simulated else "RAM réelle"
         ram_used = n.mem_avg if n.mem_avg else n.mem
         ram_used_tag = " (1h)" if n.mem_avg else ""
         ram_pct = ((ram_used / n.maxmem * 100.0)
@@ -877,6 +948,43 @@ def print_migration_plan(logger: logging.Logger, plans: List[Dict], title: str,
 
 
 # ---------------------------------------------------------------------------
+# COMPATIBILITÉ QEMU/MACHINE (v13)
+# ---------------------------------------------------------------------------
+# PVE refuse une migration vers un nœud dont le binaire QEMU est trop
+# ancien pour la machine de la VM :
+#   TASK ERROR: Installed QEMU version '10.1.2' is too old to run machine
+#   type 'pc-i440fx-11.1+pve0', please upgrade node '…'
+# Une machine « pc-i440fx-X.Y » (ou « q35-X.Y ») exige QEMU ≥ X.Y ; les
+# alias « pc »/« q35 » sont RÉSOLUS au DÉMARRAGE de la VM (dans la
+# version courante du QEMU du nœud d'exécution) — c'est pourquoi la
+# sonde lit la machine RÉSOLUE dans la ligne de commande du processus,
+# pas la valeur brute de la config. Tant que le cluster est hétérogène
+# (rolling upgrade en cours), ce filtre dirige chaque VM uniquement
+# vers des nœuds capables de l'exécuter.
+def _machine_version(machine: Optional[str]) -> Optional[Tuple[int, int]]:
+    """Extrait (majeur, mineur) d'un nom de machine PVE, ou None si
+    inconnu/alias (pc, q35) ➔ pas de contrainte explicite de version."""
+    if not machine:
+        return None
+    m = re.search(r"-(\d+)\.(\d+)", machine)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def _qemu_version(version: Optional[str]) -> Optional[Tuple[int, int]]:
+    """Extrait (majeur, mineur) d'une version de binaire QEMU
+    (« 10.1.2 » ➔ (10, 1)). None/absent ➔ None : sonde indisponible,
+    on reste PERMISSIF (le garde-fou de PVE s'applique quand même)."""
+    if not version:
+        return None
+    m = re.search(r"(\d+)(?:\.(\d+))?", version)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2) or 0))
+
+
+# ---------------------------------------------------------------------------
 # SÉLECTEUR DE PLACEMENT (partagé réel/dry-run)
 # ---------------------------------------------------------------------------
 def plan_migrations(state: ClusterState, source: NodeInfo,
@@ -920,6 +1028,43 @@ def plan_migrations(state: ClusterState, source: NodeInfo,
     for vm in [v for v in sorted(source.vms, key=lambda v: -v.maxmem)
                if not (exclude_ha and v.vmid in state.ha_vmids)]:
         placed = False
+        # Compatibilité QEMU/machine (v13) : ne proposer que des cibles
+        # dont le QEMU sait exécuter la machine RÉSOLUE de la VM. Les
+        # VMs LXC n'ont pas de machine ; les invités arrêtés ne sont
+        # pas migrés (ils restent sur place pendant le reboot), et la
+        # sonde ne voit dans `ps` que les processus DÉMARÉS — le filtre
+        # ne s'applique donc qu'aux candidates réelles de migration.
+        # Sonde absente pour un nœud (échec SSH, version non parsée) ➔
+        # pas de contrainte : on reste permissif, PVE garde son garde-fou.
+        mver = _machine_version(state.vm_machine.get(vm.vmid))
+        if mver is not None:
+            compat = [t for t in targets
+                      if _qemu_version(state.node_qemu.get(t.name)) is None
+                      or _qemu_version(state.node_qemu.get(t.name)) >= mver]
+            if not compat:
+                # Aucune cible ne sait exécuter cette machine : donner
+                # la remédiation AVANT d'échouer (l'upgrade du nœud
+                # cible est la vraie solution ; en attendant, seule
+                # une VM ARRÊTÉE peut rester sur un nœud plus ancien).
+                versions = ", ".join(
+                    f"{t.name}={state.node_qemu.get(t.name, '?')}"
+                    for t in targets)
+                raise RuntimeError(
+                    f"Impossible de placer {vm} : sa machine "
+                    f"'{state.vm_machine[vm.vmid]}' exige QEMU ≥ "
+                    f"{mver[0]}.{mver[1]} et aucune cible disponible ne "
+                    f"le supporte ({versions}). Remédiation : (1) "
+                    f"arrêter la VM puis 'qm set {vm.vmid} --machine "
+                    f"<famille>-<{mver[0]}.{mver[1]}>' (la machine "
+                    f"n'est PAS changeable à chaud — au redémarrage "
+                    f"elle redescend au niveau le plus ancien du "
+                    f"cluster), ou (2) laisser cette VM ARRÊTÉE "
+                    f"pendant ce run (un invité arrêté reste sur "
+                    f"place, reboot inclus), ou (3) upgrader un nœud "
+                    f"cible puis relancer le run.")
+            targets_for_vm = compat
+        else:
+            targets_for_vm = targets
         # Affinité HA : strict=1 = CONTRAINTE DURE (aucun repli — le
         # CRM la respecterait de toute façon) ; strict=0 = PRÉFÉRENCE
         # (sémantique du CRM : repli autorisé si saturation, cf. wiki
@@ -928,16 +1073,17 @@ def plan_migrations(state: ClusterState, source: NodeInfo,
         affinity = state.ha_affinity.get(vm.vmid)
         aff_no_target = False
         if hard is not None:
-            allowed = [t for t in targets if t.name in hard]
+            allowed = [t for t in targets_for_vm if t.name in hard]
             if not allowed:
                 raise RuntimeError(
                     f"Impossible de placer {vm} : sa règle d'affinité "
                     f"DURE (strict=1) n'autorise que "
                     f"{', '.join(sorted(hard))} et aucun de ces nœuds "
                     f"n'est une cible disponible (online, hors "
-                    f"maintenance) pour vider {source.name}.")
+                    f"maintenance, QEMU compatible) pour vider "
+                    f"{source.name}.")
         elif affinity is not None:
-            allowed = [t for t in targets if t.name in affinity]
+            allowed = [t for t in targets_for_vm if t.name in affinity]
             if not allowed:
                 # Règle SOFT (strict=0) dont AUCUN nœud préféré n'est
                 # une cible disponible — cas typique : règle mono-nœud
@@ -961,7 +1107,7 @@ def plan_migrations(state: ClusterState, source: NodeInfo,
             # NB : pas de raise — une préférence vide ne bloque
             # JAMAIS l'évacuation, contrairement au strict=1.
         else:
-            allowed = targets
+            allowed = list(targets_for_vm)
         # Anti-affinité « keep separate » (resource-affinity negative) :
         # une cible qui héberge (ou hébergera — migrations déjà plani-
         # fiées) une VM du groupe séparé est écartée. Violation DURE
@@ -1150,21 +1296,57 @@ def plan_migrations(state: ClusterState, source: NodeInfo,
     return plans
 
 
+def hors_rule_vmids(state: ClusterState) -> Set[int]:
+    """Ressources HA dont le nœud COURANT de l'état (simulé ou réel)
+    n'est PAS autorisé par leur règle 'node-affinity' (soft OU dure) :
+    typiquement déplacées pendant l'Étape 1 pendant le sommeil des
+    règles (le placement était LIBRE — c'est le but), ou repliées
+    hors règle à la réactivation HA (saturation strict=0). Ce sont
+    elles que le CRM re-localisera au dégel final (pour une DURE :
+    certain ; pour une soft : probable). Les VMs sans HA sont exclues :
+    le CRM ne les gère pas, aucune churn possible."""
+    out: Set[int] = set()
+    for vmid, aff in state.ha_affinity.items():
+        if vmid not in state.ha_vmids:
+            continue
+        for n in state.nodes.values():
+            if any(v.vmid == vmid for v in n.vms):
+                if n.name not in aff:
+                    out.add(vmid)
+                break
+    return out
+
+
 def plan_off_rule_failback(state: ClusterState, logger: logging.Logger,
-                           vmids: Set[int]) -> List[Dict]:
-    """Avant le rééquilibrage final : rapatrie vers leurs nœuds préférés
-    (règle 'node-affinity' strict=0) les ressources HA qui ont été repliées
-    HORS règle pendant l'Étape 1 (saturation du site au moment de
-    l'évacuation). Objectif : un dégel final COHÉRENT — sans cela, le CRM
+                           vmids: Set[int],
+                           second_pass: bool = False) -> List[Dict]:
+    """Avant le rééquilibrage final : rapatrie vers leurs nœuds de règle
+    TOUTE ressource HA qui se trouve encore HORS règle à ce stade :
+    - repli strict=0 pendant l'Étape 1 (saturation au moment de
+      l'évacuation — l'ensemble passé en argument, suivi par le run),
+    - ET toute ressource déplacée pendant que les règles étaient en
+      sommeil (l'Étape 1 vide les contraintes : une VM mono-nœud est
+      forcément déplacée hors règle quand SON nœud est évacué) —
+      détecté par hors_rule_vmids(), règle soft OU dure, VM running
+      (le CRM la re-migrerait au dégel) comme stopped (migration hors
+      ligne : elle sera déjà conforme à sa prochaine mise route —
+      onboot=1 au boot du nœud compris).
+    Objectif : un dégel final COHÉRENT — sans cela, le CRM
     re-migrerait la ressource hors-règle juste après le dégel (« nach
-    kurzer Zeit », forum Proxmox), cassant en post-run l'équilibre que le
-    rééquilibrage vient d'atteindre. Le rapatriement est planifié ICI (état
-    simulé muté, mêmes sémantiques que plan_rebalance) et exécuté PENDANT
-    la fenêtre de gel CRM, AVANT le rééquilibrage proprement dit — le
-    rééquilibrage optimise donc AUTOUR du placement conforme.
-    Si aucun nœud de la règle ne respecte la marge RAM/CPU : la ressource
-    reste sur son hôte de repli (WARNING) et le CRM décidera au dégel
-    (comportement attendu, pas une anomalie)."""
+    kurzer Zeit », forum Proxmox), cassant en post-run l'équilibre que
+    le rééquilibrage vient d'atteindre. Le rapatriement est planifié ICI
+    (état simulé muté, mêmes sémantiques que plan_rebalance) et exécuté
+    PENDANT la fenêtre de gel CRM, AVANT le rééquilibrage proprement
+    dit — le rééquilibrage optimise donc AUTOUR du placement conforme.
+    Si aucun nœud de la règle ne respecte la marge RAM/CPU : la
+    ressource reste sur son hôte actuel (WARNING) — en 1re passe
+    (second_pass=False), le WARNING annonce la SECONDE passe
+    post-rééquilibrage (toujours rejouée dans la fenêtre de gel) ;
+    en seconde passe (second_pass=True), seule issue restante, il
+    annonce l'action du CRM au dégel — certaine pour une règle DURE
+    (strict=1), probable pour une soft (comportement attendu, pas
+    une anomalie)."""
+    vmids = set(vmids) | hors_rule_vmids(state)
     plans: List[Dict] = []
     for vmid in sorted(vmids):
         vm = None
@@ -1184,6 +1366,8 @@ def plan_off_rule_failback(state: ClusterState, logger: logging.Logger,
         if src.name in affinity:
             # déjà sur un nœud de sa règle (edge/reprise) : rien à faire
             continue
+        hard_rule = vmid in state.ha_affinity_hard
+        kind = "DURE (strict=1)" if hard_rule else "soft (strict=0)"
         sep_hard = state.ha_separate_hard.get(vmid, set())
         sep_soft = state.ha_separate.get(vmid, set())
         together = state.ha_together.get(vmid, set())
@@ -1205,14 +1389,38 @@ def plan_off_rule_failback(state: ClusterState, logger: logging.Logger,
                     continue
                 cands.append(n)
         if not cands:
-            logger.warning(
-                f"  {vm} : rapatriement impossible sur sa règle "
-                f"({', '.join(sorted(affinity))}, strict=0) — aucun nœud "
-                f"de la règle ne respecte la marge RAM/CPU, la limite "
-                f"anti-overcommit mémoire ou l'anti-affinité "
-                f"keep-separate : elle reste sur "
-                f"{src.name} (hôte de repli) ; le CRM pourra la "
-                f"re-migrer après le dégel (comportement attendu).")
+            if second_pass:
+                logger.warning(
+                    f"  {vm} : rapatriement impossible sur sa règle "
+                    f"({', '.join(sorted(affinity))}, {kind}) même "
+                    f"après le rééquilibrage — aucun nœud de la règle "
+                    f"ne respecte la marge RAM/CPU, la limite "
+                    f"anti-overcommit mémoire ou l'anti-affinité "
+                    f"keep-separate : elle reste sur "
+                    f"{src.name} (hôte actuel) ; le CRM "
+                    + ("la RELOCALISERA au dégel (règle DURE violée)"
+                       if hard_rule else
+                       "pourra la re-migrer après le dégel (préférence)")
+                    + " (comportement attendu, pas une anomalie).")
+            else:
+                # 1re passe : la SECONDE passe post-rééquilibrage est
+                # TOUJOURS rejouée ensuite (même fenêtre de gel) — ne
+                # pas annoncer une relocalisation CRM comme certaine,
+                # le rééquilibrage peut libérer le nœud de règle
+                # saturé (cas réel RHOSPDC : DUREs 101/103).
+                logger.warning(
+                    f"  {vm} : rapatriement impossible sur sa règle "
+                    f"({', '.join(sorted(affinity))}, {kind}) à la 1re "
+                    f"passe — aucun nœud de la règle ne respecte la "
+                    f"marge RAM/CPU, la limite anti-overcommit mémoire "
+                    f"ou l'anti-affinité keep-separate à ce stade : "
+                    f"elle reste sur {src.name} (hôte actuel) ; "
+                    f"SECONDE PASSE de rapatriement prévue après le "
+                    f"rééquilibrage — si elle échoue aussi, le CRM "
+                    + ("la RELOCALISERA au dégel (règle DURE violée)"
+                       if hard_rule else
+                       "pourra la re-migrer après le dégel (préférence)")
+                    + " (comportement attendu, pas une anomalie).")
             continue
         # cible : nœud de la règle avec le PLUS de marge RAM ; préférence
         # de groupe (positive) : nœud hébergeant déjà une VM du même
@@ -1234,9 +1442,17 @@ def plan_off_rule_failback(state: ClusterState, logger: logging.Logger,
                       "target_mem_after": declared_load(tgt),
                       "target_maxmem": tgt.maxmem,
                       "off_rule_failback": True})
+        extra = ""
+        if vm.status != "running":
+            extra = (" ; VM stopped : migration HORS LIGNE (métadonnées "
+                     "seules), elle sera déjà sur un nœud conforme à sa "
+                     "prochaine mise en route")
+        pass_note = (" — 2e passe post-rééquilibrage"
+                     if second_pass else "")
         logger.info(f"  {vm} : rapatriement {src.name} ➔ {tgt.name} "
-                    f"(nœud de sa règle strict=0 — marge RAM restante "
-                    f"après placement : {gb(tgt.ram_free_margin())}) : "
+                    f"(nœud de sa règle {kind}{pass_note}{extra} — marge RAM "
+                    f"restante après placement : "
+                    f"{gb(tgt.ram_free_margin())}) : "
                     f"le dégel final n'aura rien à corriger ✔")
     return plans
 
@@ -1598,14 +1814,16 @@ class ProxmoxClient:
         # Cluster sans Ceph (détection mémoïsée) : gates Ceph ignorées
         self._no_ceph = False          # True dès qu'on a prouvé l'absence
         self._no_ceph_logged = False   # log informatif émis UNE fois
+        # Remédiation MON_CLOCK_SKEW autorisée ? En dry-run le script
+        # n'exécute RIEN sur les nœuds : l'Updater positionne ce
+        # drapeau à False, et la remédiation se borne alors à EXPLIQUER
+        # ce que le run réel ferait (aucun restart chrony, aucun
+        # makestep, aucun restart de mon).
+        self.can_remediate = True
         # Bilan dry-run : détection des guests avec disque sur stockage
         # NON partagé, mémoïsée par (vmtype, vmid) -> True/False/None.
         self._vm_local_disks: Dict[Tuple[str, int], Optional[bool]] = {}
         self._vm_onboot: Dict[Tuple[str, int], Optional[bool]] = {}
-        # Storages partagés par nœud (GET /nodes/{node}/storage) :
-        # None = échec MÉMOÏSÉ pour ce nœud — les guests suivants ne
-        # redéclenchent PAS un cycle de bascule d'hôte API complet.
-        self._shared_storages_cache: Dict[str, Optional[Set[str]]] = {}
         self._connect_api()
         # Découverte dynamique de tous les nœuds du cluster
         if not API_HOSTS:
@@ -2354,7 +2572,53 @@ class ProxmoxClient:
         except Exception as e:
             self.log.warning(f"Règles d'affinité HA illisibles ({e}) — "
                              f"placement HA sans contrainte d'affinité.")
+        try:
+            self.qemu_compat_scan(state)
+        except Exception as e:
+            self.log.debug(f"Sonde QEMU/machine non exécutée : {e}")
         return state
+
+    def qemu_compat_scan(self, state: ClusterState) -> None:
+        """Sonde de compatibilité QEMU/machine (v13) : pour chaque nœud
+        online, UNE session SSH lit (1) la version du binaire QEMU et
+        (2) via `ps`, la machine TELLE QUE LE PROCESS L'EXÉCUTE —
+        l'alias « pc »/« q35 » de la config y est déjà RÉSOLU en
+        « pc-i440fx-X.Y+pveN » par le QEMU du nœud qui a démarré la
+        VM (c'est la seule façon fiable de connaître la version de
+        machine réellement exigée : `qm listmachines` n'existe pas).
+        Remplit state.node_qemu (nœud ➔ « 10.1.2 ») et state.vm_machine
+        (vmid ➔ « pc-i440fx-11.1+pve0 ») ; les invités arrêtés ne sont
+        pas migrés et n'apparaissent pas dans `ps`, ils ne sont donc
+        pas contraints. Toute erreur (SSH, binaire absent, sortie non
+        parsée) laisse l'entrée ABSENTE : absence = PAS de contrainte
+        (on reste permissif ; le garde-fou natif de PVE s'applique de
+        toute façon au moment de la migration)."""
+        for node in [n for n in state.nodes.values() if n.status == "online"]:
+            try:
+                # NB : sur PVE le binaire QEMU est lancé via le symlink
+                # /usr/bin/kvm — le comm du process n'est DONC PAS
+                # fiable pour `ps -C` ; on filtre sur les args COMPLETS
+                # (`ps -eww -o args=`), en excluant le grep lui-même.
+                out = self._ssh(
+                    node.name,
+                    "qemu-system-x86_64 --version 2>/dev/null | head -1; "
+                    "echo '---'; "
+                    "ps -eww -o args= 2>/dev/null "
+                    "| grep -E 'qemu-system-x86_64|/usr/bin/kvm ' "
+                    "| grep -v 'grep '")
+            except Exception as e:
+                self.log.debug(f"Sonde QEMU indisponible sur {node.name} "
+                               f"({e}) — nœud traité sans contrainte.")
+                continue
+            head, _, ps_out = out.partition("---")
+            m = re.search(r"version\s+(\d+(?:\.\d+)+)", head)
+            if m:
+                state.node_qemu[node.name] = m.group(1)
+            for line in ps_out.splitlines():
+                mid = re.search(r"-id\s+(\d+)", line)
+                mmac = re.search(r"-machine[ =]([^\s,]+)", line)
+                if mid and mmac:
+                    state.vm_machine[int(mid.group(1))] = mmac.group(1)
 
     def node_names(self) -> List[str]:
         # NB : GET /nodes expose le nom du nœud sous la clé "node"
@@ -2761,6 +3025,272 @@ class ProxmoxClient:
                 self.log.error(f"  {unit} TOUJOURS inactif après "
                                f"restart — voir la 2f-bis qui suivra.")
 
+    # --- REMÉDIATION MON_CLOCK_SKEW (« clock skew » après reboot) ------
+    @staticmethod
+    def ceph_clock_skews(st: Optional[Dict]) -> List[Tuple[str, str]]:
+        """(mon, message) des checks MON_CLOCK_SKEW du status Ceph. La
+        ligne du health NOMME le coupable (« mon.p-proxc02 clock skew
+        0.156993s > max 0.05s ») : sur PVE, le mon porte le NOM du nœud
+        qui l'héberge (pveceph crée les mons nommés d'après les nœuds) —
+        c'est donc le nœud dont l'horloge est décalée. La recherche
+        couvre le résumé ET les lignes de détail (le nom peut n'apparaî-
+        tre que dans l'une des deux selon la version de Ceph), et les
+        mons sont dédupliqués. Lecture pure."""
+        out: List[Tuple[str, str]] = []
+        checks = ((st or {}).get("health") or {}).get("checks") or {}
+        for code, c in sorted(checks.items()):
+            if code != "MON_CLOCK_SKEW":
+                continue
+            msgs = [((c.get("summary") or {}).get("message") or "")]
+            msgs += [d.get("message") or ""
+                     for d in (c.get("detail") or [])]
+            for m in msgs:
+                mm = re.search(r"mon\.([A-Za-z0-9][\w.-]*)", m or "")
+                if not mm:
+                    continue
+                mon = mm.group(1).rstrip(".,;:")
+                if mon and all(mon != x[0] for x in out):
+                    out.append((mon, (m or "").strip()))
+        return out
+
+    def _clock_fix_node(self, node: str) -> bool:
+        """Remédie l'horloge du nœud coupable d'un clock skew. Retourne
+        True si l'horloge est PROUVÉE juste à la fin (chrony synchronisé
+        et offset sous le seuil). État lu en UNE seule commande SSH :
+        « systemctl is-active chrony ; chronyc tracking ». Décisions :
+          - chrony INACTIF → restart du service (l'horloge dérive
+            sans lui) ;
+          - actif mais NON synchronisé → restart du service (au boot,
+            chrony peut partir avant le réseau et rester bloqué sur
+            des sources mortes : un restart après stabilisation du
+            nœud refait la résolution) ;
+          - synchronisé mais offset > CLOCK_SKEW_MAX_S → « chronyc
+            makestep » (saute l'heure MAINTENANT : le rattrapage
+            progressif de chrony laisse le warning vivre des minutes) ;
+          - déjà juste → RIEN (reliquat : les mons ré-évalueront seuls,
+            ~30s)."""
+        try:
+            out = self._ssh(
+                node,
+                "systemctl is-active chrony 2>/dev/null; echo ---; "
+                "chronyc tracking 2>/dev/null")
+        except Exception as e:
+            self.log.warning(f"[Ceph] {node} : état chrony illisible "
+                             f"({e}) — remédiation horloge impossible.")
+            return False
+        parts = out.split("---")
+        active = parts[0].strip().lower() == "active"
+        tracking = parts[1] if len(parts) > 1 else ""
+        sync = ("Leap status" in tracking
+                and "Not synchronised" not in tracking)
+        mm = re.search(r"System time\s*:\s*([0-9.]+)\s*seconds",
+                       tracking)
+        offset = abs(float(mm.group(1))) if mm else None
+        if not active:
+            self.log.warning(f"[Ceph] {node} : chrony INACTIF → "
+                             f"restart du service.")
+            action = "systemctl restart chrony"
+        elif not sync:
+            self.log.warning(f"[Ceph] {node} : chrony actif mais NON "
+                             f"synchronisé (sources NTP mortes ?) → "
+                             f"restart du service.")
+            action = "systemctl restart chrony"
+        elif offset is not None and offset > CLOCK_SKEW_MAX_S:
+            self.log.warning(f"[Ceph] {node} : synchronisé mais offset "
+                             f"{offset:.3f}s > {CLOCK_SKEW_MAX_S}s → "
+                             f"chronyc makestep (saut d'heure "
+                             f"immédiat).")
+            action = "chronyc makestep"
+        else:
+            self.log.info(f"[Ceph] {node} : horloge déjà juste "
+                          f"(synchronisée, offset "
+                          f"{f'{offset:.3f}s' if offset is not None else '?'}"
+                          f") — pas d'action, le warning partira à la "
+                          f"prochaine ré-évaluation des mons (~30s).")
+            return True
+        try:
+            self._ssh(node, action)
+        except Exception as e:
+            self.log.error(f"[Ceph] {node} : « {action} » IMPOSSIBLE "
+                           f"({e}).")
+            return False
+        if action == "chronyc makestep":
+            # le pas est immédiat : une re-lecture suffit
+            time.sleep(2)
+        # attendre la resynchronisation (restart) / vérifier le pas
+        t0 = time.time()
+        while time.time() - t0 < CLOCK_CHRONY_TIMEOUT_S:
+            try:
+                out = self._ssh(
+                    node,
+                    "systemctl is-active chrony 2>/dev/null; "
+                    "echo ---; chronyc tracking 2>/dev/null")
+            except Exception:
+                time.sleep(5)
+                continue
+            parts = out.split("---")
+            if parts[0].strip().lower() != "active":
+                time.sleep(5)
+                continue
+            tracking = parts[1] if len(parts) > 1 else ""
+            if "Leap status" not in tracking \
+                    or "Not synchronised" in tracking:
+                time.sleep(5)
+                continue
+            mm = re.search(r"System time\s*:\s*([0-9.]+)\s*seconds",
+                           tracking)
+            off = abs(float(mm.group(1))) if mm else None
+            if off is None or off <= CLOCK_SKEW_MAX_S:
+                self.log.info(f"[Ceph] {node} : chrony synchronisé "
+                              f"(offset "
+                              f"{f'{off:.3f}s' if off is not None else '?'}"
+                              f") ✔")
+                return True
+            time.sleep(5)
+        self.log.error(f"[Ceph] {node} : chrony toujours pas "
+                       f"resynchronisé après {CLOCK_CHRONY_TIMEOUT_S}s "
+                       f"— vérifiez « chronyc sources » (NTP joignable "
+                       f"?), le pare-feu UDP/123 et la connectivité du "
+                       f"nœud.")
+        return False
+
+    def _clock_wait_clear(self, timeout_s: int, context: str) -> bool:
+        """Attend que les mons ré-évaluent l'horloge (intervalle
+        mon_timecheck_skew_interval, ~30 s) et que MON_CLOCK_SKEW
+        disparaisse du status. Un skew dont l'horloge devient juste
+        part TOUT SEUL — aucun restart de mon nécessaire."""
+        t0 = time.time()
+        next_beat = 0
+        while time.time() - t0 < timeout_s:
+            elapsed = int(time.time() - t0)
+            if elapsed >= next_beat:
+                next_beat = elapsed + 30
+                self.log.info(f"[Ceph] {context} : attente de la "
+                              f"ré-évaluation des mons "
+                              f"({elapsed}s/{timeout_s}s)…")
+            time.sleep(5)
+            try:
+                if not self.ceph_clock_skews(self.ceph_status()):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _clock_mon_restart(self, mon: str, st: Optional[Dict],
+                           context: str) -> bool:
+        """DERNIER RECOURS : restart du mon signalé skewé alors que
+        l'horloge de son nœud est PROUVÉE juste — c'est le mon qui
+        garde un relevé décalé (mon mal réveillé après le reboot,
+        latence de heartbeat). UN SEUL mon à la fois, et UNIQUEMENT si
+        le quorum conserve la majorité STRICTE : sans majorité, TOUT
+        le cluster fige ses IO — refusé sur un cluster à 2 mons (le
+        restart en laisserait 1/2). Gate : retour du mon au quorum
+        sous CLOCK_MON_REJOIN_TIMEOUT_S."""
+        mons = ((st or {}).get("monmap") or {}).get("mons") or []
+        rank = next((m.get("rank") for m in mons
+                     if m.get("name") == mon), None)
+        quorum = (st or {}).get("quorum") or []
+        nq, nmon = len(quorum), len(mons)
+        majority = nmon // 2 + 1
+        if rank is None or rank not in quorum:
+            self.log.warning(f"[Ceph] mon.{mon} hors quorum/inconnu — "
+                             f"pas de restart (ce n'est pas un skew, "
+                             f"c'est un mon down : la gate santé "
+                             f"tranchera).")
+            return False
+        remaining = nq - 1
+        if nmon < 3 or remaining < majority:
+            self.log.warning(
+                f"[Ceph] restart de mon.{mon} REFUSÉ : il ne "
+                f"resterait que {remaining}/{nmon} en quorum "
+                f"(< majorité {majority}) — sans majorité stricte, "
+                f"tout le cluster figerait ses IO. Correctif manuel "
+                f"requis une fois le run terminé.")
+            return False
+        self.log.warning(
+            f"[Ceph] {context} : skew persistant malgré une horloge "
+            f"prouvée juste → DERNIER RECOURS : restart "
+            f"ceph-mon@{mon} (quorum {nq}/{nmon}, reste "
+            f"{remaining} ≥ majorité {majority}, IO continues).")
+        try:
+            self._ssh(mon, f"systemctl restart ceph-mon@{mon}.service")
+        except Exception as e:
+            self.log.error(f"[Ceph] restart ceph-mon@{mon} IMPOSSIBLE "
+                           f"({e}).")
+            return False
+        # gate : retour du mon au quorum
+        t0 = time.time()
+        while time.time() - t0 < CLOCK_MON_REJOIN_TIMEOUT_S:
+            time.sleep(5)
+            try:
+                s2 = self.ceph_status() or {}
+            except Exception:
+                continue
+            mons2 = ((s2.get("monmap") or {}).get("mons") or [])
+            rank2 = next((m.get("rank") for m in mons2
+                          if m.get("name") == mon), rank)
+            if rank2 in (s2.get("quorum") or []):
+                self.log.info(f"[Ceph] mon.{mon} DE RETOUR au quorum ✔")
+                return True
+        self.log.error(f"[Ceph] mon.{mon} pas revenu au quorum sous "
+                       f"{CLOCK_MON_REJOIN_TIMEOUT_S}s — la gate santé "
+                       f"tranchera (arrêt propre du run).")
+        return False
+
+    def ceph_clock_skew_fix(self, st: Optional[Dict], context: str) -> bool:
+        """Remédie un MON_CLOCK_SKEW détecté dans le status Ceph :
+        1) horloge du/des nœud(s) coupable(s) — restart chrony ou
+           makestep (rien si l'horloge est déjà juste) ;
+        2) attente de la ré-évaluation par les mons (~30 s) — un skew
+           à horloge juste part SEUL ;
+        3) DERNIER RECOURS : restart du mon si (et seulement si)
+           l'horloge est prouvée juste ET que le quorum garde la
+           majorité stricte (PVE_CEPH_CLOCK_MON_RESTART=0 pour
+           l'interdire). Retourne True si plus AUCUN MON_CLOCK_SKEW ne
+        subsiste. En dry-run (can_remediate=False) : n'exécute RIEN,
+        se borne à expliquer ce que le run réel fera."""
+        skews = self.ceph_clock_skews(st)
+        if not skews:
+            return True
+        for mon, msg in skews:
+            self.log.warning(f"[Ceph] MON_CLOCK_SKEW ({context}) : {msg}")
+        if not self.can_remediate:
+            self.log.warning(
+                f"[Ceph] Dry-run : RIEN n'est exécuté. Le run réel "
+                f"remédierait automatiquement : restart chrony (ou "
+                f"chronyc makestep) sur le(s) nœud(s) signalé(s) "
+                f"({', '.join(sorted(m for m, _ in skews))}), attente "
+                f"de ré-évaluation des mons, puis restart du mon en "
+                f"DERNIER RECOURS si le quorum garde la majorité "
+                f"stricte (refusé à 2 mons).")
+            return False
+        known = set(self.node_names())
+        for mon, _msg in skews:
+            if mon not in known:
+                self.log.warning(
+                    f"[Ceph] mon.{mon} ne correspond à aucun nœud du "
+                    f"cluster — horloge non remédiable par le script : "
+                    f"vérifiez manuellement sa synchro NTP "
+                    f"(« chronyc sources ») sur l'hôte qui le porte.")
+                continue
+            self._clock_fix_node(mon)
+        # ré-évaluation : un skew à horloge juste part SEUL
+        if self._clock_wait_clear(CLOCK_REEVAL_TIMEOUT_S, context):
+            return True
+        still = self.ceph_clock_skews(self.ceph_status())
+        if not still:
+            return True
+        if str(_env("PVE_CEPH_CLOCK_MON_RESTART", "1")) != "0":
+            st2 = self.ceph_status()
+            for mon, _msg in still:
+                self._clock_mon_restart(mon, st2, context)
+            # dernière ré-évaluation après rejointure du mon
+            return self._clock_wait_clear(CLOCK_REEVAL_TIMEOUT_S, context)
+        self.log.warning(f"[Ceph] PVE_CEPH_CLOCK_MON_RESTART=0 : "
+                         f"restart du mon DÉSACTIVÉ — skew persistant "
+                         f"laissé en l'état (la gate santé décidera).")
+        return not self.ceph_clock_skews(self.ceph_status())
+
     def ceph_maintenance_on(self, node: str) -> Dict[str, bool]:
         """Reboot planifié : pose les flags de maintenance Ceph. Retourne
         UNIQUEMENT les flags que LE RUN a posés (les flags déjà posés
@@ -2849,7 +3379,13 @@ class ProxmoxClient:
         checks de sécurité cephx AUTH_INSECURE_* tolérés si
         PVE_CEPH_ALLOW_AUTH_INSECURE=1 — avis CVE-2025-30156, sans
         impact stockage/disponibilité).
-        Vérifie aussi que tous les OSDs du nœud sont 'up'."""
+        Vérifie aussi que tous les OSDs du nœud sont 'up'.
+        Un check MON_CLOCK_SKEW (« mon.X clock skew … > max 0.05s »,
+        typique au retour d'un nœud après reboot/upgrade noyau) est
+        remédié AUTOMATIQUEMENT (restart chrony / chronyc makestep,
+        puis restart du mon en DERNIER RECOURS si le quorum garde la
+        majorité stricte) ; en dry-run rien n'est exécuté, il est
+        toléré avec une explication (le run réel le corrigerait)."""
         st = self.ceph_status()
         if st is None:
             # cluster sans Ceph : message informatif UNE fois, puis silence
@@ -2864,6 +3400,7 @@ class ProxmoxClient:
             self.ceph_log_auth_insecure(ignored)
         t0 = time.time()
         diag_done = False       # diagnostic détaillé affiché UNE fois
+        skew_attempted = False   # remédiation MON_CLOCK_SKEW tentée UNE fois
         while health not in ("HEALTH_OK",):
             if not diag_done:
                 self.ceph_diagnose(st)
@@ -2872,6 +3409,32 @@ class ProxmoxClient:
                 self.log.warning("Ceph en HEALTH_WARN — toléré "
                                  "(PVE_CEPH_ALLOW_WARN=1)")
                 break
+            # MON_CLOCK_SKEW : warning d'HORLOGE, bénin pour le
+            # stockage, typique d'un nœud qui revient d'un reboot —
+            # remédiation automatique au lieu de laisser la gate
+            # échouer sur un problème que chrony corrige en quelques
+            # secondes. Le cluster peut aussi être resté skewé d'un
+            # reboot antérieur (hors run) : la gate le corrige alors
+            # AVANT de démarrer l'évacuation.
+            if "MON_CLOCK_SKEW" in ((st.get("health") or {})
+                                    .get("checks") or {}) \
+                    and not skew_attempted:
+                skew_attempted = True
+                if self.ceph_clock_skew_fix(
+                        st, f"avant {action} de {node}"):
+                    st = self.ceph_status() or {}
+                    health, _ignored = self.ceph_effective_health(st)
+                    continue
+                if not self.can_remediate:
+                    # dry-run : le run réel remédierait et repasserait
+                    # cette gate — toléré avec explication explicite.
+                    self.log.warning(
+                        "Ceph en HEALTH_WARN (MON_CLOCK_SKEW) — TOLÉRÉ "
+                        "pour ce dry-run : rien n'est exécuté, mais le "
+                        "run réel remédierait automatiquement (restart "
+                        "chrony / makestep, puis restart du mon en "
+                        "dernier recours) et repasserait cette gate.")
+                    break
             if time.time() - t0 > timeout:
                 checks = (st.get("health") or {}).get("checks") or {}
                 ai_only = bool(checks) and all(
@@ -2884,6 +3447,14 @@ class ProxmoxClient:
                         "INSECURE=1 les tolère ; remédiation définitive "
                         "= migration des clés vers « aes256k »."
                         if ai_only else "")
+                if set(checks) == {"MON_CLOCK_SKEW"}:
+                    hint = (" NB : il ne reste qu'un MON_CLOCK_SKEW — "
+                            "la remédiation automatique (restart "
+                            "chrony / makestep, restart du mon en "
+                            "dernier recours) n'a pas suffi : l'horloge "
+                            "du nœud signalé ne se resynchronise pas "
+                            "(« chronyc sources » : NTP joignable ? "
+                            "pare-feu UDP/123 ?).")
                 raise RuntimeError(
                     f"Ceph est en {health} depuis plus de {timeout}s — "
                     f"{action} de {node} REFUSÉ : un nœud ne doit pas "
@@ -3006,6 +3577,49 @@ class ProxmoxClient:
             return self.with_api(lambda p: p.cluster.ha.rules.get())
         except Exception:
             return []
+
+    def ha_rule_update(self, rid: str, **params) -> None:
+        """PUT /cluster/ha/rules/{rid} : met à jour une règle d'affinité.
+        NB CRITIQUE (schéma PVE 9, vérifié sur un run réel 9.1/9.2) : le
+        PUT exige TOUJOURS le paramètre « type » (le schéma est
+        type-dépendant : sans lui, tout autre champ de sous-schéma est
+        refusé « property is not defined in schema ») ; selon la version
+        de PVE, le champ « disable » peut ne PAS être exposé par l'API
+        (alors que ha-manager le connaît) → toujours passer `type`, et
+        prévoir les modes de repli « resources » / « delete »."""
+        self.with_api(lambda p: p.cluster.ha.rules(rid).put(**params))
+
+    def ha_rule_delete(self, rid: str) -> None:
+        """DELETE /cluster/ha/rules/{rid} : dernier recours pour mettre
+        une règle « en sommeil » sur un PVE dont l'API refuse à la fois
+        « disable » et « resources » vides — la définition d'origine est
+        dans le snapshot, la règle est recréée à l'identique en fin
+        d'Étape 1 (ou à la reprise d'un run interrompu)."""
+        self.with_api(lambda p: p.cluster.ha.rules(rid).delete())
+
+    def ha_rule_get(self, rid: str) -> Optional[Dict]:
+        """Re-lit l'état COURANT d'une règle HA côté cluster (GET
+        /cluster/ha/rules, filtrage local par rid) : retourne la règle,
+        None si elle est absente. À la différence de ha_rules() —
+        silencieux sur échec — cette méthode LÈVE en cas d'erreur
+        transport : elle sert à VÉRIFIER qu'un PUT a bien eu son EFFET,
+        car un PUT accepté (HTTP 200) peut rester SANS EFFET côté HA
+        Manager (cas PVE 9 : « disable=0 » ne réactive PAS une règle
+        désactivée — correctif officiel pve-manager : SUPPRIMER la
+        propriété « disable »)."""
+        for r in self.with_api(lambda p: p.cluster.ha.rules.get()):
+            if str(r.get("rid") or r.get("rule") or r.get("id")
+                   or "") == rid:
+                return r
+        return None
+
+    def ha_rule_create(self, **params) -> None:
+        """POST /cluster/ha/rules : recrée une règle supprimée par un
+        run interrompu (définition d'origine du snapshot). NB : le
+        paramètre d'identifiant du schéma PVE 9 est « rule » ( PAS
+        « rid » : un POST avec « rid » est refusé 400 — « property is
+        not defined in schema » + « rule is missing »)."""
+        self.with_api(lambda p: p.cluster.ha.rules.post(**params))
 
     # ---------- gestion HA « pilotée par le script » (PVE < 9.2 : pas de
     # CRS dynamic, le CRM ne tient pas compte de la charge lors d'une
@@ -3258,9 +3872,45 @@ class ProxmoxClient:
                 time.sleep(5)
                 continue
             if st.get("status") == "stopped":
-                if st.get("exitstatus") in ("OK", None):
+                exitstatus = st.get("exitstatus")
+                if exitstatus in ("OK", None):
                     return
-                raise RuntimeError(f"Tâche {upid} échouée : {st.get('exitstatus')}")
+                # PVE rend « WARNINGS: n » pour une tâche RÉUSSIE mais
+                # NON SILENCIEUSE (ex. job de backup avec 1 avertis-
+                # sement, migration avec remarque) : seul un exitstatus
+                # « ERROR… » est un échec (règle Proxmox,
+                # PVE::Tools::upid_status_is_error). Interrompre tout
+                # le run pour un simple avertissement casait l'upgrade
+                # en pleine évacuation pour rien — on LOGUE les
+                # avertissements puis on continue normalement.
+                if re.fullmatch(r"WARNINGS: \d+", str(exitstatus)):
+                    self.log.warning(
+                        f"  Tâche {upid} terminée avec {exitstatus} — "
+                        f"considérée RÉUSSIE (règle Proxmox : seul "
+                        f"« ERROR » est un échec). Détail :")
+                    try:
+                        rows = self.with_api(
+                            lambda p: p.nodes(node).tasks(upid).log.get())
+                        warns: List[str] = []
+                        for row in (rows if isinstance(rows, list) else []):
+                            line = (row.get("t", "")
+                                    if isinstance(row, dict) else str(row))
+                            if ("WARNING" in line.upper()
+                                    and not line.strip().upper().startswith(
+                                        "TASK WARNINGS")):
+                                warns.append(line.strip())
+                        for w in warns[:3]:
+                            self.log.warning(f"    ⚠ {w}")
+                        if len(warns) > 3:
+                            self.log.warning(
+                                f"    … +{len(warns) - 3} autres "
+                                f"avertissements (log complet : "
+                                f"pvesh get /nodes/{node}/tasks/"
+                                f"{upid}/log)")
+                    except Exception as e:
+                        self.log.debug(f"    (log de tâche illisible : {e})")
+                    return
+                raise RuntimeError(f"Tâche {upid} échouée : {exitstatus}")
             time.sleep(5)
         # Timeout : l'attente est purement CLIENTE — la tâche peut TOUJOURS
         # tourner côté Proxmox. Pour une live migration, la laisser finir
@@ -3588,6 +4238,7 @@ class ProxmoxClient:
                         deg)
 
             first_degraded = _vitals(st)[5]
+            skew_attempted = False   # remédiation MON_CLOCK_SKEW tentée UNE fois
             while health != "HEALTH_OK" and time.time() - t0 < timeout:
                 if not diag_done:
                     self.ceph_diagnose(st)
@@ -3596,6 +4247,20 @@ class ProxmoxClient:
                     self.log.warning("  Ceph HEALTH_WARN après reboot — "
                                      "toléré (PVE_CEPH_ALLOW_WARN=1)")
                     break
+                # MON_CLOCK_SKEW post-reboot : le mon de CE nœud mesure
+                # une horloge encore décalée (RTC au boot, chrony pas
+                # resynchronisé) — remédiation AUTOMATIQUE (restart
+                # chrony / makestep sur le nœud signalé, puis restart du
+                # mon en DERNIER RECOURS si majorité stricte) au lieu
+                # d'attendre le timeout pour un warning d'horloge.
+                if "MON_CLOCK_SKEW" in ((st.get("health") or {})
+                                        .get("checks") or {}) \
+                        and not skew_attempted:
+                    skew_attempted = True
+                    if self.ceph_clock_skew_fix(st, "après reboot"):
+                        st = self.ceph_status() or {}
+                        health, ignored = self.ceph_effective_health(st)
+                        continue
                 nq, nmon, up, n_in, tot, deg = _vitals(st)
                 self.log.info(
                     f"  Ceph {health} après reboot — attente du retour à "
@@ -3640,6 +4305,19 @@ class ProxmoxClient:
                         f"{first_degraded} → {deg}, en baisse) — "
                         f"récupération tolérée, elle continue en "
                         f"arrière-plan pendant le reste du run.")
+                elif codes == {"MON_CLOCK_SKEW"}:
+                    # verdict dédié : le message générique « mon/OSD
+                    # probablement tombé » serait FAUX ici (quorum et
+                    # OSDs sont sains, seule l'horloge est en cause).
+                    self.ceph_diagnose(st)
+                    self.log.error(
+                        f"  Ceph toujours en MON_CLOCK_SKEW après le "
+                        f"reboot malgré la remédiation (restart chrony / "
+                        f"makestep, puis restart du mon en dernier "
+                        f"recours si majorité stricte) — l'horloge de "
+                        f"{node} ne se resynchronise pas : vérifiez "
+                        f"« chronyc sources » (NTP joignable ?), le "
+                        f"pare-feu UDP/123, puis relancez le run.")
                 else:
                     self.ceph_diagnose(st)
                     self.log.error(
@@ -3741,6 +4419,12 @@ class Updater:
         self.log = logger
         self.dry = dry_run
         self.client = client
+        # Dry-run = RIEN n'est exécuté sur les nœuds : la remédiation
+        # MON_CLOCK_SKEW (restart chrony / makestep / restart mon)
+        # doit donc être désactivée côté client (elle se borne alors
+        # à expliquer ce que le run réel ferait).
+        if client is not None:
+            client.can_remediate = not dry_run
         self.maintenance_nodes: List[str] = []   # pour le bloc finally
         self.touched = False   # le run a-t-il MODIFIÉ le cluster ?
         self.evacuated: Dict[str, List[Dict]] = {}   # nœud -> plans d'évacuation
@@ -3748,6 +4432,40 @@ class Updater:
         # sid -> état HA d'origine {"state","comment"} des ressources
         # détachées en 'ignored' : à restaurer en TOUT ÉTAT DE CAUSE.
         self.ha_snapshot: Dict[str, Dict] = {}
+        # rid -> règle 'node-affinity' mise « en sommeil » par ce run
+        # (disable, OU ressources vidées, OU suppression temporaire
+        # selon le schéma de l'API PVE — cf. _ha_rule_disable), pour
+        # libérer le placement pendant TOUTE l'Étape 1 — les règles
+        # actives « pollueraient » le comportement du CRM et le
+        # planning du script pendant les migrations pilotées :
+        #   {"rule": <définition ORIGINALE complète de la règle>,
+        #    "was_disabled": False, "mode": "disable|resources|delete"}
+        # Réactivées à la FIN de l'Étape 1 (disable remis à son état
+        # d'origine, ou définition restaurée par fusion/recréation),
+        # rapatriement/rééquilibrage — une seule fois par run, pas à
+        # chaque sortie de maintenance de nœud (sinon le CRM re-décide
+        # des relocate à chaque nœud : churn). En mode --node, la fin de
+        # l'Étape 1 EST la sortie de maintenance du nœud. Persistées
+        # dans le fichier d'état ("ha_rules") pour la reprise après
+        # interruption, avec le MODE de mise en sommeil utilisé
+        # (disable / ressources vidées / suppression — cf.
+        # _ha_rule_disable). NB : les règles déjà désactivées par un
+        # admin ne sont PAS touchées (pas de snapshot, pas de PUT).
+        self.ha_rules_snapshot: Dict[str, Dict] = {}
+        # mode de mise en sommeil qui a fonctionné sur l'API de CE
+        # cluster (déterminé à la première règle du run) : les règles
+        # suivantes vont directement au bon mode, sans réessayer les
+        # modes que le schéma de l'API refuse.
+        self._ha_rule_mode_hint: Optional[str] = None
+        # (ha_affinity, ha_affinity_hard) d'ORIGINE : sauvegarde au moment
+        # de la désactivation des règles (ces deux structures ne sont
+        # alimentées QUE par les règles node-affinity), rendue à la
+        # réactivation — le rééquilibrage final et le rapatriement des
+        # hors-règle redeviennent contraints par les règles, comme le
+        # CRM. En mémoire uniquement : après une interruption, le run
+        # suivant reconstruit tout via fetch_state.
+        self._affinity_backup: Optional[Tuple[Dict[int, Set[str]],
+                                              Dict[int, Set[str]]]] = None
         # Flags Ceph de maintenance posés PAR LE RUN (reboot planifié) :
         # {flag: True} — à retirer en fin de fenêtre, en TOUT ÉTAT DE
         # CAUSE (persistés dans le fichier d'état pour le run suivant).
@@ -3805,15 +4523,72 @@ class Updater:
     def _state_write(self) -> None:
         """Persiste l'état à restaurer. Appelé à CHAQUE transition (détach,
         réactivation) : si le script est tué, le fichier reflète le
-        dernier état connu. Absent en dry-run (aucune modification)."""
-        if self.dry:
-            return
+        dernier état connu.
+        En dry-run, SEULES les règles node-affinity sont réellement
+        modifiées (mise en sommeil, cf. 2b-bis) : on ne persiste qu'elles,
+        en FUSION avec un éventuel fichier d'un run --execute
+        interrompu (ressources 'ignored', nœuds en maintenance…) que le
+        dry-run ne doit JAMAIS écraser."""
+        path = self._state_file()
         try:
-            data = {"updated": datetime.now().isoformat(timespec="seconds"),
-                    "maintenance": self.maintenance_nodes,
-                    "ha_ignored": self.ha_snapshot,
-                    "ceph_flags": self.ceph_flags}
-            with open(self._state_file(), "w", encoding="utf-8") as fh:
+            if self.dry:
+                old: Dict[str, object] = {}
+                if os.path.exists(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as fh:
+                            old = json.load(fh)
+                    except Exception:
+                        old = {}
+                merged = dict(old.get("ha_rules") or {})
+                merged.update(self.ha_rules_snapshot)
+                data = {"updated": datetime.now().isoformat(
+                            timespec="seconds"),
+                        "maintenance": old.get("maintenance") or [],
+                        "ha_ignored": old.get("ha_ignored") or {},
+                        "ha_rules": merged,
+                        "ceph_flags": old.get("ceph_flags") or {}}
+            else:
+                data = {"updated": datetime.now().isoformat(timespec="seconds"),
+                        "maintenance": self.maintenance_nodes,
+                        "ha_ignored": self.ha_snapshot,
+                        "ha_rules": self.ha_rules_snapshot,
+                        "ceph_flags": self.ceph_flags}
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=1)
+        except Exception as e:
+            self.log.warning(f"Fichier d'état non écrit ({e}) — "
+                             f"la reprise après plantage sera dégradée.")
+
+    def _state_rules_drop(self, rids) -> None:
+        """Dry-run uniquement : retire du fichier d'état les règles
+        node-affinity qui viennent d'être RÉELLEMENT réactivées (fin
+        d'Étape 1 ou reprise au démarrage) ; supprime le fichier s'il
+        ne reste plus rien à récupérer. Les éventuelles sections d'un
+        run --execute interrompu (ressources 'ignored', maintenance,
+        flags Ceph) sont PRÉSERVÉES telles quelles."""
+        path = self._state_file()
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            self.log.warning(f"Fichier d'état non relu ({e}) — les règles "
+                             f"restaurées y restent tracées (inoffensif).")
+            return
+        rules = dict(data.get("ha_rules") or {})
+        for rid in rids:
+            rules.pop(rid, None)
+        if (not rules
+                and not data.get("ha_ignored")
+                and not data.get("maintenance")
+                and not data.get("ceph_flags")):
+            self._state_clear()
+            return
+        data["ha_rules"] = rules
+        data["updated"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=1)
         except Exception as e:
             self.log.warning(f"Fichier d'état non écrit ({e}) — "
@@ -3849,7 +4624,8 @@ class Updater:
         res = data.get("ha_ignored", {})
         maint = data.get("maintenance", [])
         flags = data.get("ceph_flags", {})
-        if not res and not maint and not flags:
+        rules = data.get("ha_rules", {})
+        if not res and not maint and not flags and not rules:
             # Fichier résiduel SANS rien à récupérer : run interrompu
             # (ex. Ctrl-C) APRÈS restauration complète de l'état zéro —
             # typiquement pendant la fenêtre de stabilité CRM de fin.
@@ -3877,11 +4653,61 @@ class Updater:
             self.log.info(f"Flags Ceph de maintenance laissés posés "
                           f"(run interrompu pendant un reboot) : "
                           f"{', '.join(sorted(flags))}")
+        if rules:
+            self.log.info(f"Règles node-affinity laissées désactivées/"
+                          f"détachées ({len(rules)}) : "
+                          f"{', '.join(sorted(rules))}")
         if self.dry:
-            self.log.info("[SIMULATION] En exécution réelle, ces ressources "
-                          "seraient réactivées dans leur état d'origine et "
-                          "ces nœuds sortis de maintenance.")
+            # Règles node-affinity : réactivées POUR DE VRAI même en
+            # dry-run — c'est la même action réversible que la
+            # désactivation 2b-bis (le fichier d'état trace des PUT
+            # disable=1 réellement posés), et c'est l'occasion de TESTER
+            # le mécanisme de reprise sans attendre le run réel. Le
+            # reste (ressources 'ignored', maintenance, flags Ceph)
+            # reste SIMULÉ : sortir un nœud d'une maintenance ou
+            # réactiver une ressource n'a rien d'anodin.
+            if rules:
+                reenabled: List[str] = []
+                for rid, entry in sorted(rules.items()):
+                    entry = entry or {}
+                    try:
+                        if "removed" in entry:
+                            self._ha_rule_restore_legacy(rid, entry)
+                        else:
+                            self._ha_rule_restore(rid, entry)
+                        self.log.info(f"  Règle {rid} : restaurée "
+                                      f"(action RÉELLE — dry-run) ✔")
+                        reenabled.append(rid)
+                    except Exception as e:
+                        self.log.error(f"Règle {rid} : restauration "
+                                       f"IMPOSSIBLE ({e}) — vérifiez "
+                                       f"manuellement (« pvesh get "
+                                       f"/cluster/ha/rules »).")
+                self._state_rules_drop(reenabled)
+            self.log.info("[SIMULATION] Pour le reste (ressources HA en "
+                          "'ignored', nœuds en maintenance, flags Ceph) : "
+                          "AUCUNE action en dry-run — relancez en mode "
+                          "--execute pour la remise à l'état zéro.")
             return
+        # Règles d'affinité D'ABORD : le CRM applique la préférence dès
+        # la réactivation des ressources qui suit (failback attendu).
+        # Deux formats possibles selon la version qui a laissé le
+        # fichier : « removed » = ANCIEN format (ressources retirées,
+        # règle éventuellement supprimée) ; sinon format actuel (mise
+        # en sommeil par disable / ressources vidées / suppression,
+        # selon le mode mémorisé dans l'entrée).
+        for rid, entry in sorted(rules.items()):
+            entry = entry or {}
+            try:
+                if "removed" in entry:
+                    self._ha_rule_restore_legacy(rid, entry)
+                else:
+                    self._ha_rule_restore(rid, entry)
+                self.log.info(f"  Règle {rid} : restaurée ✔")
+            except Exception as e:
+                self.log.error(f"Règle {rid} : restauration IMPOSSIBLE "
+                               f"({e}) — vérifiez manuellement "
+                               f"(« pvesh get /cluster/ha/rules »).")
         for sid, orig in res.items():
             try:
                 # comment passé tel quel (même vide) pour EFFACER le label
@@ -3929,9 +4755,9 @@ class Updater:
         # un fichier d'état vide (run précédent arrêté avant toute
         # écriture) ne justifie pas la fenêtre de stabilité de 60s
         # en fin de run.
-        if res or maint:
+        if res or maint or rules:
             self.touched = True
-        if res or maint:
+        if res or maint or rules:
             try:
                 self.client.wait_ha_settled()
             except Exception as e:
@@ -4165,7 +4991,9 @@ class Updater:
         # simuler, elles échoueraient réellement si le cluster allait mal.
         # ... sauf la récupération d'un run interrompu, qui MODIFIE le
         # cluster en --execute (réactivation des ressources HA laissées
-        # en 'ignored', sortie des maintenances résiduelles).
+        # en 'ignored', sortie des maintenances résiduelles) et, même en
+        # dry-run, pour les SEULES règles node-affinity (mises en
+        # sommeil réelles et réversibles, tracées dans le fichier d'état).
         self._recover_interrupted_run()
         st = self.client.with_api(lambda p: p.cluster.status.get())
         cname = next((s.get("name", "?") for s in st
@@ -4175,6 +5003,34 @@ class Updater:
         versions = self.client.node_versions()
         self.log.info(f"Cluster : {cname} — "
                       f"versions/nœuds accessibles : {versions}")
+        # Hétérogénéité QEMU (v13) : pendant un rolling upgrade, les
+        # nœuds déjà upgradés portent un QEMU plus récent ; une VM
+        # démarrée là-bas a pu RÉSOLU une machine (« pc-i440fx-11.1 »)
+        # que les autres nœuds ne sauront pas exécuter à la migration.
+        # Prévenir AVANT de démarrer, tant qu'on peut encore figer les
+        # machines ou arrêter les VMs concernées.
+        if self.state.node_qemu:
+            uqs = sorted(set(self.state.node_qemu.values()))
+            if len(uqs) > 1:
+                self.log.warning(
+                    f"QEMU HÉTÉROGÈNE sur ce cluster "
+                    f"({', '.join(uqs)}) : "
+                    + ", ".join(f"{n}={v}" for n, v in
+                                sorted(self.state.node_qemu.items())))
+                oldest = min(_qemu_version(v) for v in uqs)
+                risky = [f"VM {vmid} ({mach})"
+                         for vmid, mach in sorted(self.state.vm_machine.items())
+                         if (_machine_version(mach) or (0, 0)) > oldest]
+                if risky:
+                    self.log.warning(
+                        "  Machines PLUS RÉCENTES que le QEMU le plus "
+                        "ancien (migration vers les nœuds anciens "
+                        "refusée par PVE) : " + ", ".join(risky))
+                    self.log.warning(
+                        "  Si une évacuation les concerne : la FIGER "
+                        "après arrêt (qm set <vmid> --machine "
+                        "<famille>-<X.Y>), la laisser ARRÊTÉE pendant "
+                        "le run, ou upgrader d'abord un nœud cible.")
         # Présence de Ceph (détection mémoïsée : ce premier appel pose
         # le drapeau _no_ceph si le cluster n'a pas de Ceph — les gates
         # Ceph seront donc silencieusement ignorées pendant tout le run).
@@ -4225,12 +5081,492 @@ class Updater:
                 self.log.info(base)
 
         # self.state a déjà été chargé dans run() (API en lecture seule pour dry-run)
-        print_occupancy_table(self.log, self.state, "ÉTAT INITIAL DU CLUSTER")
+        print_occupancy_table(
+            self.log, self.state, "ÉTAT INITIAL DU CLUSTER",
+            note=("« RAM réelle » = mémoire consommée MESURÉE du nœud ; "
+                  "« Σ déclarée » = Σ RAM max des guests running — la "
+                  "pression anti-overcommit que le run répartit/égalise. "
+                  "Deux métriques distinctes : l'état final simulé "
+                  "s'apprécie sur « Σ déclarée », pas sur « RAM réelle »."))
         gap = pressure_gap(self.state)
         if gap is not None:
             self.log.info(f"Écart de pression RAM initial (max-min) : {gap:.0%} "
                           f"(cible de rééquilibrage : "
                           f"AUTO — optimum théorique calculé en fin de run)")
+
+    # ---------- mise en sommeil temporaire des règles node-affinity ----------
+    # Le planning du script (plan_migrations) ET le CRM respectent les
+    # règles HA « node-affinity » : pendant l'Étape 1 (évacuations +
+    # upgrades), ces règles « pollueraient » le comportement du CRM
+    # (relocate décidé à chaque sortie de maintenance, en pleine
+    # évacuation du nœud suivant) et contraindraient le placement du
+    # script (strict=1 : évacuation BLOQUÉE ; strict=0 : repli « hors
+    # règle » avec réactivation HA différée). On met donc TOUTES les
+    # règles node-affinity du cluster « en sommeil » une seule fois par
+    # run, au début de l'Étape 1, selon le mode que le schéma de
+    # l'API PVE du cluster accepte (cf. _ha_rule_disable : PUT
+    # `type`+`disable=1` ; sinon PUT `type`+`resources=""` — la règle
+    # ne s'applique plus à rien, définition conservée ; sinon DELETE
+    # temporaire avec recréation à l'identique) et on les restaure
+    # à la FIN de l'Étape 1, avant le rapatriement/rééquilibrage :
+    # ceux-ci redeviennent contraints par les règles et le dégel
+    # final reste cohérent (le CRM n'a pas une vague de relocate à
+    # corriger en pleine Étape 2). Les règles déjà désactivées par un
+    # admin ne sont pas touchées. Les resource-affinity (« keep
+    # separate » / « together ») ne sont JAMAIS touchées : contraintes
+    # de sécurité de groupe, elles restent actives du début à la fin.
+    # NB dry-run : ces mises en sommeil/restaurations sont effectuées
+    # POUR DE VRAI (action réversible ; retirer une préférence ne
+    # déplace aucune ressource, et une restauration sur des
+    # placements conformes n'en déplace pas non plus) — c'est le seul
+    # moyen de TESTER le mécanisme avant le run réel. Tout le reste
+    # (migrations, apt, reboot, maintenance, détachement HA) reste
+    # simulé ; le fichier d'état trace ces actions réelles pour la
+    # reprise après interruption, en préservant toute section d'un
+    # run --execute interrompu.
+    @staticmethod
+    def _ha_rule_rid(r: Dict) -> str:
+        """Identifiant d'une règle HA (champ « rid » de l'API PVE,
+        avec repli sur d'autres libellés possibles)."""
+        return str(r.get("rid") or r.get("rule") or r.get("id") or "")
+
+    @staticmethod
+    def _ha_rule_resources_list(s) -> List[str]:
+        """Liste des sids ('vm:102', 'ct:8000') du champ `resources`
+        d'une règle HA (chaîne séparée par des virgules)."""
+        return [x.strip() for x in str(s or "").split(",") if x.strip()]
+
+    @staticmethod
+    def _ha_rule_res_vmids(resources) -> Set[int]:
+        """vmids des ressources listées par une règle HA."""
+        out: Set[int] = set()
+        for s in Updater._ha_rule_resources_list(resources):
+            if ":" not in s:
+                continue
+            try:
+                out.add(int(s.split(":", 1)[1]))
+            except ValueError:
+                continue
+        return out
+
+    def _ha_affinity_recompute(self, state: ClusterState, rules: List[Dict],
+                               vmids: Set[int]) -> None:
+        """Ré-applique dans l'état en mémoire les contributions des
+        règles node-affinity ACTIVES (non désactivées) pour les vmids
+        donnés — sémantique EXACTE de fetch_state (positive : ses
+        nœuds ; affinity=negative : tous les nœuds SAUF les siens ;
+        strict=1 : intersection dure). Utilisé quand une désactivation
+        de règle a ÉCHOUÉ : la règle est toujours active côté cluster,
+        l'état en mémoire doit le refléter."""
+        for v in vmids:
+            state.ha_affinity.pop(v, None)
+            state.ha_affinity_hard.pop(v, None)
+        for r in rules:
+            if r.get("type") != "node-affinity" or r.get("disable"):
+                continue
+            allowed = {n.strip() for n in str(r.get("nodes", "")
+                                             ).split(",") if n.strip()}
+            if not allowed:
+                continue
+            if str(r.get("affinity", "positive")).lower() == "negative":
+                allowed = set(state.nodes.keys()) - allowed
+                if not allowed:
+                    continue
+            try:
+                strict_rule = bool(int(r.get("strict", 0) or 0))
+            except (TypeError, ValueError):
+                strict_rule = False
+            for res in self._ha_rule_resources_list(r.get("resources", "")):
+                if ":" not in res:
+                    continue
+                try:
+                    vmid = int(res.split(":", 1)[1])
+                except ValueError:
+                    continue
+                if vmid not in vmids:
+                    continue
+                state.ha_affinity.setdefault(vmid, set()).update(allowed)
+                if strict_rule:
+                    if vmid in state.ha_affinity_hard:
+                        state.ha_affinity_hard[vmid] &= allowed
+                    else:
+                        state.ha_affinity_hard[vmid] = set(allowed)
+
+    def _ha_rule_disable(self, rid: str, r: Dict) -> Optional[str]:
+        """Met une règle node-affinity « en sommeil » de façon COMPATIBLE
+        avec le schéma de l'API PVE de ce cluster, en cascade :
+        1. « disable »  : PUT `type` + `disable=1`. Le schéma des règles
+           est TYPE-DÉPENDANT : « type » est OBLIGATOIRE dans le PUT
+           (sans lui, « disable » est refusé « property is not defined
+           in schema » — constaté sur un PVE 9.1/9.2 en run réel) ; et
+           selon la version de PVE, « disable » peut ne pas être exposé
+           par l'API du tout (alors que ha-manager le connaît) ;
+        2. « resources » : PUT `type` + `resources=""` — la règle ne
+           s'applique plus à AUCUNE ressource : effet identique pour
+           le CRM et pour le planning, identifiant et définition
+           conservés (le champ `disable`, si le PVE l'expose, n'est
+           pas touché) ;
+        3. « delete »    : DELETE — dernier recours (API qui refuse
+           aussi `resources` vides) ; la définition d'origine est dans
+           le snapshot, la règle est recréée à l'identique à la
+           restauration.
+        Le mode qui fonctionne est mémorisé pour TOUT le run : les
+        règles suivantes vont directement au bon mode (au plus UN
+        refus 400 bruyant par run, au premier essai). Retourne le mode
+        utilisé, None si toute la cascade a échoué."""
+        rtype = str(r.get("type") or "node-affinity")
+        modes = ["disable", "resources", "delete"]
+        hint = getattr(self, "_ha_rule_mode_hint", None)
+        if hint in modes:
+            modes.remove(hint)
+            modes.insert(0, hint)
+        last_err: Optional[Exception] = None
+        for mode in modes:
+            try:
+                if mode == "disable":
+                    self.client.ha_rule_update(rid, type=rtype, disable=1)
+                elif mode == "resources":
+                    self.client.ha_rule_update(rid, type=rtype, resources="")
+                else:
+                    self.client.ha_rule_delete(rid)
+            except Exception as e:
+                last_err = e
+                self.log.warning(f"  2b-bis) Règle {rid} : mode "
+                                 f"« {mode} » refusé par l'API ({e}).")
+                continue
+            # VÉRIFICATION OBLIGATOIRE (re-lecture) : un PUT ACCEPTÉ
+            # (HTTP 200) peut rester SANS EFFET côté HA Manager — le
+            # code retour seul NE PROUVE RIEN. Le mode n'est retenu que
+            # si l'effet est CONFIRMÉ sur le cluster.
+            try:
+                cur = self.client.ha_rule_get(rid)
+            except Exception as e:
+                # lecture impossible : ni confirmé ni infirmé — le mode
+                # est retenu (comportement historique), mais explicité.
+                self.log.warning(f"  2b-bis) Règle {rid} : effet du mode "
+                                f"« {mode} » NON VÉRIFIABLE ({e}) — mode "
+                                f"retenu sans confirmation de lecture.")
+                self._ha_rule_mode_hint = mode
+                return mode
+            if mode == "disable":
+                ok = cur is not None and bool(cur.get("disable"))
+                attendu = "disable=1 constaté"
+            elif mode == "resources":
+                ok = cur is not None and not self._ha_rule_resources_list(
+                    cur.get("resources", ""))
+                attendu = "ressources vidées constatées"
+            else:
+                ok = cur is None
+                attendu = "règle absente constaté"
+            if not ok:
+                last_err = RuntimeError(
+                    f"PUT accepté mais effet NON CONSTATÉ ({attendu})")
+                self.log.warning(f"  2b-bis) Règle {rid} : mode "
+                                 f"« {mode} » accepté par l'API mais "
+                                 f"SANS EFFET côté cluster — cascade "
+                                 f"vers le mode suivant.")
+                continue
+            if getattr(self, "_ha_rule_mode_hint", None) is None \
+                        and mode != "disable":
+                self.log.info(f"  2b-bis) L'API de ce PVE refuse "
+                              f"« disable » : mode « {mode} » retenu "
+                              f"pour toutes les règles de ce run.")
+            self._ha_rule_mode_hint = mode
+            return mode
+        self.log.error(f"Règle {rid} : mise en sommeil IMPOSSIBLE "
+                       f"({last_err}) — elle reste ACTIVE, le "
+                       f"planning garde sa contrainte.")
+        return None
+
+    def _ha_rule_equivalent_exists(self, rules: List[Dict],
+                                   orig: Dict) -> Optional[Dict]:
+        """Règle ÉQUIVALENTE à la définition d'origine (même type, mêmes
+        nœuds, ressources couvrantes) : la règle a pu être recréée
+        manuellement sous un AUTRE identifiant (GUI, pvesh, run
+        antérieur). Retourne cette règle, sinon None. À n'appeler que si
+        la règle d'origine est ABSENTE : évite de créer un DOUBLON à la
+        restauration (cas réel : règle vm:502 recréée manuellement)."""
+        orig_type = str(orig.get("type") or "node-affinity")
+        orig_nodes = {n.strip() for n in str(orig.get("nodes", "")
+                                           ).split(",") if n.strip()}
+        orig_res = set(self._ha_rule_resources_list(orig.get("resources",
+                                                             "")))
+        for r in rules:
+            if str(r.get("type") or "") != orig_type:
+                continue
+            r_nodes = {n.strip() for n in str(r.get("nodes", "")
+                                            ).split(",") if n.strip()}
+            if orig_nodes and r_nodes != orig_nodes:
+                continue
+            if orig_res and not orig_res <= set(
+                    self._ha_rule_resources_list(r.get("resources", ""))):
+                continue
+            return r
+        return None
+
+    def _ha_rule_definition_restore(self, rid: str, orig: Dict) -> None:
+        """Rend une définition de règle à nouveau effective (modes
+        « resources » et « delete », et reprise de l'ANCIEN format de
+        fichier d'état) : règle présente → PUT de FUSION (ressources
+        courantes ∪ ressources d'origine) ; règle absente → recréation
+        par POST (paramètre « rule » du schéma PVE 9, PAS « rid »), sauf
+        si une règle équivalente a été recréée entre-temps
+        (anti-doublon)."""
+        rules = self.client.ha_rules()
+        cur = next((r for r in rules if self._ha_rule_rid(r) == rid), None)
+        orig_res = self._ha_rule_resources_list(orig.get("resources", ""))
+        otype = str(orig.get("type")
+                    or (cur or {}).get("type") or "node-affinity")
+        if cur is None:
+            equiv = self._ha_rule_equivalent_exists(rules, orig)
+            if equiv is not None:
+                self.log.info(f"  Règle {rid} : déjà recréée sous un autre "
+                              f"identifiant ({self._ha_rule_rid(equiv)}) — "
+                              f"aucun doublon créé.")
+                return
+            params: Dict[str, object] = {"rule": rid, "type": otype,
+                                         "resources": ",".join(orig_res)}
+            for k in ("nodes", "affinity", "strict", "comment"):
+                v = orig.get(k)
+                if v not in (None, ""):
+                    params[k] = v
+            self.client.ha_rule_create(**params)
+        else:
+            merged = sorted(set(self._ha_rule_resources_list(
+                cur.get("resources", ""))) | set(orig_res))
+            self.client.ha_rule_update(rid, type=otype,
+                                       resources=",".join(merged))
+        # VÉRIFICATION par re-lecture (même discipline que le mode
+        # « disable ») : un PUT/POST ACCEPTÉ ne prouve rien — la règle
+        # doit exister ET couvrir les ressources d'origine, sinon
+        # échec EXPLICITE (la règle reste dans le fichier d'état, le
+        # prochain run la réactivera).
+        cur2 = self.client.ha_rule_get(rid)
+        if cur2 is None or not (set(orig_res) <= set(
+                self._ha_rule_resources_list(cur2.get("resources", "")))):
+            raise RuntimeError(
+                "restauration de la définition sans effet constaté "
+                "(règle absente ou ressources d'origine non couvertes "
+                "après un PUT/POST pourtant accepté)")
+
+    def _ha_rule_restore(self, rid: str, entry: Dict) -> None:
+        """Restaure une règle mise en sommeil selon le mode utilisé :
+        « disable » → réactivation (cf. ci-dessous) ou disable remis
+        à 1 si la règle ÉTAIT déjà désactivée avant le run ;
+        « resources »/« delete » → définition d'origine de nouveau
+        effective (fusion ou recréation). Lève en cas d'échec :
+        l'appelant garde alors la règle dans le fichier d'état pour le
+        prochain run.
+        NB RÉACTIVATION (mode « disable », bug PVE 9 constaté en run
+        réel RHOSPDC 9.1.2 + correctif officiel pve-manager ≥ 9.0.7) :
+        depuis un changement du HA Manager, « disable=0 » ne réactive
+        PLUS une règle désactivée — le PUT est ACCEPTÉ (HTTP 200) mais
+        reste SANS EFFET. La seule réactivation fiable est de
+        SUPPRIMER la propriété « disable » (paramètre standard
+        « delete » des PUT PVE : delete=disable). Cascade avec
+        « disable=0 » en repli (PVE antérieurs), puis VÉRIFICATION par
+        re-lecture : plus jamais de « réactivée ✔ » de façade."""
+        orig = entry.get("rule") or {}
+        mode = str(entry.get("mode") or "disable")
+        if mode == "disable":
+            otype = str(orig.get("type") or "node-affinity")
+            was = int(bool(entry.get("was_disabled", False)))
+            if was:
+                self.client.ha_rule_update(rid, type=otype, disable=1)
+                return
+            err: Optional[Exception] = None
+            for attempt in ("delete-prop", "zero"):
+                try:
+                    if attempt == "delete-prop":
+                        self.client.ha_rule_update(rid, type=otype,
+                                                   delete="disable")
+                    else:
+                        self.client.ha_rule_update(rid, type=otype,
+                                                   disable=0)
+                except Exception as e:
+                    err = e
+                    continue
+                cur = self.client.ha_rule_get(rid)
+                if cur is None:
+                    err = RuntimeError("la règle a DISPARU du cluster "
+                                       "pendant la restauration")
+                    continue
+                if not bool(cur.get("disable")):
+                    return      # réactivation CONFIRMÉE par re-lecture
+                err = RuntimeError("PUT accepté mais la règle est restée "
+                                   "désactivée côté cluster")
+            raise RuntimeError(
+                "réactivation IMPOSSIBLE : la propriété « disable » n'a "
+                "pu être ni supprimée (« delete=disable ») ni remise à 0 "
+                f"({err}) — la règle est restée DÉSACTIVÉE côté cluster")
+        self._ha_rule_definition_restore(rid, orig)
+
+    def _ha_rules_disable_all(self, state: ClusterState) -> None:
+        """2b-bis) Met « en sommeil » TOUTES les règles HA
+        « node-affinity » du cluster, une seule fois par run (idempotent
+        : un snapshot non vide = déjà traitées). Mode adapté au schéma
+        de l'API PVE (cf. _ha_rule_disable) : disable, sinon ressources
+        vidées, sinon suppression temporaire. Les règles déjà
+        désactivées par un admin ne sont ni touchées ni mémorisées ;
+        les resource-affinity ne sont jamais touchées. L'état en
+        mémoire (ha_affinity / ha_affinity_hard, alimentés UNIQUEMENT
+        par les node-affinity) est sauvegardé puis vidé : le planning
+        de toute l'Étape 1 est LIBRE. L'opération est effectuée POUR DE
+        VRAI aussi en dry-run (action réversible : test du mécanisme),
+        persistée dans le fichier d'état pour la reprise."""
+        if self.ha_rules_snapshot:
+            return          # déjà désactivées ce run
+        try:
+            rules = self.client.ha_rules()
+        except Exception as e:
+            self.log.warning(f"Règles HA illisibles ({e}) — désactivation "
+                             f"IMPOSSIBLE, le planning garde les "
+                             f"contraintes actuelles.")
+            return
+        kept: List[Dict] = []      # mise en sommeil échouée : reste ACTIVE
+        disabled: List[str] = []
+        for r in rules:
+            if r.get("type") != "node-affinity" or r.get("disable"):
+                continue
+            rid = self._ha_rule_rid(r)
+            if not rid:
+                continue
+            if not self._ha_rule_resources_list(r.get("resources", "")):
+                continue   # déjà sans ressources : n'affecte rien
+            # NB : la mise en sommeil est effectuée POUR DE VRAI aussi
+            # en dry-run — action réversible et sans effet de bord sur
+            # des placements conformes (retirer une préférence ne
+            # déplace rien) : c'est le seul moyen de TESTER le
+            # mécanisme avant le run réel, comme demandé. Les
+            # migrations/apt/reboot restent, eux, simulés.
+            mode = self._ha_rule_disable(rid, r)
+            if mode is None:
+                kept.append(r)
+                continue
+            self.ha_rules_snapshot[rid] = {"rule": dict(r),
+                                           "was_disabled": False,
+                                           "mode": mode}
+            disabled.append(rid)
+            lbl = {"disable": "désactivée (disable=1, effet vérifié "
+                              "par re-lecture)",
+                   "resources": "mise en sommeil (ressources vidées — "
+                                "plus aucune ressource concernée, "
+                                "définition conservée)",
+                   "delete": "supprimée temporairement (recréée à "
+                             "l'identique en fin d'Étape 1)"}[mode]
+            if self.dry:
+                self.log.info(f"  2b-bis) Règle {rid} : {lbl} — action "
+                              f"RÉELLE même en dry-run (test du "
+                              f"mécanisme) ; restauration à la fin de "
+                              f"l'Étape 1 ✔")
+            else:
+                self.log.info(f"  Règle {rid} : {lbl} — restaurée à la "
+                              f"fin de l'Étape 1 ✔")
+        if not disabled:
+            return
+        # sauvegarde intégrale puis vidage : plus AUCUNE contrainte
+        # node-affinity pendant l'Étape 1.
+        self._affinity_backup = (
+            {k: set(v) for k, v in state.ha_affinity.items()},
+            {k: set(v) for k, v in state.ha_affinity_hard.items()})
+        state.ha_affinity.clear()
+        state.ha_affinity_hard.clear()
+        # mises en sommeil échouées : leurs contributions restent valables
+        # (règles toujours actives côté cluster).
+        if kept:
+            try:
+                vmids = set()
+                for r in kept:
+                    vmids |= self._ha_rule_res_vmids(r.get("resources", ""))
+                self._ha_affinity_recompute(state,
+                                            self.client.ha_rules(), vmids)
+            except Exception as e:
+                self.log.warning(f"Ré-application des règles non "
+                                 f"désactivables impossible ({e}).")
+        hint = getattr(self, "_ha_rule_mode_hint", None)
+        mode_note = f" (mode : {hint})" if hint and hint != "disable" else ""
+        self.log.info(f"{len(disabled)} règle(s) node-affinity mise(s) en "
+                      f"sommeil pour l'Étape 1 ({', '.join(disabled)})"
+                      f"{mode_note} — placement "
+                      f"LIBRE pendant les évacuations, restauration avant "
+                      f"le rééquilibrage.")
+        # persister DANS TOUS LES MODES : les mises en sommeil sont
+        # RÉELLES (dry-run compris) — un run tué en pleine Étape 1 doit
+        # pouvoir être rattrapé par la reprise du run suivant.
+        self._state_write()
+
+    def _ha_rules_restore_all(self, state: Optional[ClusterState]) -> None:
+        """Fin de l'Étape 1 : réactive les règles node-affinity mises en
+        sommeil au début du run — AVANT le rapatriement (--node) / le
+        rééquilibrage et le plan de failback des hors-règle : tout ce
+        qui suit redevient contraint par les règles, comme le CRM au
+        dégel final. Réactivation ADAPTÉE au mode utilisé (_ha_rule_
+        restore : disable remis à son état d'origine, ou définition
+        restaurée par fusion/recréation). En cas d'échec : la règle
+        reste dans le fichier d'état, le prochain run la réactivera.
+        L'action est effectuée POUR DE VRAI aussi en dry-run (miroir de
+        la mise en sommeil 2b-bis : test du mécanisme)."""
+        if not self.ha_rules_snapshot:
+            return
+        reenabled: List[str] = []
+        for rid in sorted(self.ha_rules_snapshot):
+            entry = self.ha_rules_snapshot[rid]
+            lbl = {"disable": "propriété « disable » supprimée ou remise "
+                              "à son état d'origine — réactivation "
+                              "VÉRIFIÉE par re-lecture",
+                   "resources": "ressources d'origine restaurées",
+                   "delete": "règle recréée à l'identique"}.get(
+                str(entry.get("mode") or "disable"))
+            # RÉEL aussi en dry-run : miroir exact de la mise en sommeil
+            # 2b-bis (action réversible — c'est le test demandé).
+            try:
+                self._ha_rule_restore(rid, entry)
+                if self.dry:
+                    self.log.info(f"  Fin d'Étape 1 : règle {rid} "
+                                  f"réactivée ({lbl}) — action RÉELLE "
+                                  f"même en dry-run (test du mécanisme) ✔")
+                else:
+                    self.log.info(f"  Règle {rid} : réactivée ({lbl}) ✔")
+            except Exception as e:
+                self.log.error(f"Règle {rid} : réactivation IMPOSSIBLE "
+                               f"({e}) — elle reste dans le fichier "
+                               f"d'état, le prochain run la réactivera.")
+                continue
+            del self.ha_rules_snapshot[rid]
+            reenabled.append(rid)
+        if reenabled:
+            if state is not None and self._affinity_backup is not None:
+                aff, hard = self._affinity_backup
+                state.ha_affinity.clear()
+                state.ha_affinity.update({k: set(v)
+                                          for k, v in aff.items()})
+                state.ha_affinity_hard.clear()
+                state.ha_affinity_hard.update({k: set(v)
+                                               for k, v in hard.items()})
+                self._affinity_backup = None
+            self.log.info(f"{len(reenabled)} règle(s) node-affinity "
+                          f"réactivée(s) — le placement redevient contraint "
+                          f"par les règles ; le CRM applique ses préférences "
+                          f"aux prochains placements (failback possible : "
+                          f"ATTENDU, pas une anomalie).")
+            if self.dry:
+                # ne retirer DU FICHIER que les règles réellement
+                # réactivées — une section d'un run --execute interrompu
+                # (ressources 'ignored', maintenance…) doit survivre.
+                self._state_rules_drop(reenabled)
+            else:
+                self._state_write()
+
+    def _ha_rule_restore_legacy(self, rid: str, entry: Dict) -> None:
+        """Reprise d'un fichier d'état de l'ANCIENNE version du script
+        (retrait des ressources évacuées des règles, règle SUPPRIMÉE si
+        vidée) : passe par _ha_rule_definition_restore — recrée la règle
+        manquante avec sa définition d'origine (POST, identifiant
+        « rule » — le paramètre « rid » est REFUSÉ par le schéma PVE 9),
+        ou fusionne les ressources d'origine avec les courantes si la
+        règle existe encore ; avec anti-doublon si elle a été recréée
+        sous un autre identifiant entre-temps."""
+        self._ha_rule_definition_restore(rid, entry.get("rule") or {})
 
     def update_node(self, node: str, progress: str = ""):
         state = self.state
@@ -4375,6 +5711,11 @@ class Updater:
 
         if self.dry:
             # ===== simulation : plan complet, VMs HA marquées =====
+            # 2b-bis simulé : désactivation de TOUTES les règles
+            # node-affinity (une seule fois par run) AVANT le plan —
+            # état en mémoire vidé pour un plan RÉALISTE, réactivation
+            # simulée à la fin de l'Étape 1.
+            self._ha_rules_disable_all(state)
             sim = state.clone()
             if leave_ids:
                 sim.nodes[node].vms = [v for v in sim.nodes[node].vms
@@ -4556,6 +5897,16 @@ class Updater:
                 self.log.info(f"[SIMULATION] 2g) Sortie de maintenance de "
                               f"{node} — aucune ressource HA n'a été "
                               f"détachée sur ce nœud, rien à réactiver.")
+            # 2g-bis simulé : règles node-affinity — réactivation à la
+            # sortie de maintenance seulement en mode --node ; en run
+            # complet elles restent désactivées jusqu'à la fin de
+            # l'Étape 1 (miroir du mode réel).
+            if self.only_node:
+                self._ha_rules_restore_all(state)
+            elif self.ha_rules_snapshot:
+                self.log.info(f"[SIMULATION] 2g) {node}: règles "
+                              f"node-affinity maintenues désactivées "
+                              f"(réactivation à la fin de l'Étape 1).")
             src.in_maintenance = False
             src.status = "online"
             return
@@ -4626,6 +5977,13 @@ class Updater:
         self._state_write()
         self.touched = True
         src.in_maintenance = True
+        # 2b-bis) désactivation de TOUTES les règles node-affinity du
+        # cluster (une seule fois par run) : le planning (2c) et le CRM
+        # sont LIBRES de toute préférence/contrainte node-affinity
+        # pendant TOUTE l'Étape 1 — réactivation à la fin de l'Étape 1,
+        # avant le rapatriement/rééquilibrage (run complet) ou à la
+        # sortie de maintenance du nœud (mode --node).
+        self._ha_rules_disable_all(state)
 
         try:
             # 2c) plan puis migrations réelles : les ressources HA sont
@@ -4808,6 +6166,20 @@ class Updater:
                 self._state_write()
             src.in_maintenance = False
             src.status = "online"
+            # 2g-bis) règles node-affinity : en mode --node, la fin
+            # d'Étape 1 EST la sortie de maintenance de CE nœud →
+            # réactivation AVANT la réactivation des ressources HA
+            # (le CRM applique la préférence dès la réactivation :
+            # failback ATTENDU, pas une anomalie). En run complet,
+            # elles restent désactivées jusqu'à la fin de l'Étape 1
+            # (sinon le CRM re-déciderait des relocate à CHAQUE sortie
+            # de maintenance, en pleine évacuation du nœud suivant).
+            if self.only_node:
+                self._ha_rules_restore_all(state)
+            elif self.ha_rules_snapshot:
+                self.log.info(f"{node}: règles node-affinity maintenues "
+                              f"désactivées (fin de l'Étape 1) — pas de "
+                              f"relocate CRM en pleine évacuation.")
             restored = []
             deferred_here: List[str] = []
             for sid, orig in list(self.ha_snapshot.items()):
@@ -5064,10 +6436,45 @@ class Updater:
                         self.off_rule_vmids.discard(p["vm"].vmid)
                         self.off_rule_returned.add(p["vm"].vmid)
                     self.log.info("[SIMULATION] 3a+) Rapatriement des "
-                                  "ressources repliées hors règle (strict=0) "
-                                  "vers leurs nœuds préférés ✔ — dégel final "
-                                  "cohérent, le CRM n'aura rien à corriger")
+                                  "ressources hors règle (repli strict=0 "
+                                  "ou déplacement pendant le sommeil des "
+                                  "règles) vers leurs nœuds de règle ✔ — "
+                                  "dégel final cohérent, le CRM n'aura "
+                                  "rien à corriger")
                 self._apply_migrations(plans, self.state, ha_live=True)
+                # SECONDE PASSE de rapatriement : le rééquilibrage vient
+                # de déplacer de la charge — il a pu LIBÉRER un nœud de
+                # règle qui était saturé au moment de la 1re passe (cas
+                # réel RHOSPDC : les DUREs 101/103 échouaient AVANT le
+                # rééquilibrage, leurs nœuds de règle (pes/c4) reprenaient
+                # de la place JUSTE APRÈS, libérée par les migrations du
+                # rééquilibrage). On rejoue donc le rapatriement TOUJOURS
+                # dans la fenêtre de gel, avant le dégel : sans cela, le
+                # CRM relocaliserait ces DUREs AU dégel (churn hors
+                # fenêtre, exactement ce que le rapatriement évite).
+                sim2 = self.state.clone()
+                second = plan_off_rule_failback(sim2, self.log,
+                                                set(self.off_rule_vmids),
+                                                second_pass=True)
+                if second:
+                    print_migration_plan(
+                        self.log, second,
+                        "PLAN DE RAPATRIEMENT HORS-RÈGLE — SECONDE PASSE "
+                        "(post-rééquilibrage) (SIMULATION)",
+                        ha_vmids=self.state.ha_vmids,
+                        ha_affinity=self.state.ha_affinity,
+                        ha_affinity_hard=self.state.ha_affinity_hard,
+                        ha_live=True)
+                    self._apply_migrations(second, self.state, ha_live=True)
+                    for p in second:
+                        self.off_rule_vmids.discard(p["vm"].vmid)
+                        self.off_rule_returned.add(p["vm"].vmid)
+                    self.log.info(
+                        "[SIMULATION] 3a+ bis) Seconde passe de "
+                        "rapatriement (post-rééquilibrage) : la place "
+                        "libérée par le rééquilibrage a permis de ramener "
+                        "les ressources restées hors règle à la 1re "
+                        "passe — dégel final sans relocalisation CRM ✔")
                 self.log.info("[SIMULATION] 3b) Dégel CRM : ressources HA "
                               "restaurées dans leur état d'origine + fenêtre "
                               "de stabilité CRM 60s")
@@ -5154,8 +6561,9 @@ class Updater:
                     if failback_plans:
                         self.log.info(
                             "[rebalance] Rapatriement des ressources "
-                            "repliées hors règle (strict=0) vers leurs "
-                            "nœuds préférés — AVANT le rééquilibrage, "
+                            "hors règle (repli strict=0 ou déplacement "
+                            "pendant le sommeil des règles) vers leurs "
+                            "nœuds de règle — AVANT le rééquilibrage, "
                             "pour un dégel final cohérent")
                         self._apply_migrations(failback_plans, self.state,
                                                ha_live=True)
@@ -5167,6 +6575,39 @@ class Updater:
                     if plans:
                         self._apply_migrations(plans, self.state,
                                                ha_live=True)
+                    # SECONDE PASSE de rapatriement (post-rééquilibrage,
+                    # même fenêtre de gel, cf. branche dry) : le
+                    # rééquilibrage peut avoir LIBÉRÉ le nœud de règle
+                    # saturé qui avait fait échouer la 1re passe — sans
+                    # cette passe, le CRM relocaliserait ces DUREs AU
+                    # dégel (churn hors fenêtre de gel).
+                    sim2 = self.state.clone()
+                    second = plan_off_rule_failback(sim2, self.log,
+                                                    set(self.off_rule_vmids),
+                                                    second_pass=True)
+                    if second:
+                        print_migration_plan(
+                            self.log, second,
+                            "PLAN DE RAPATRIEMENT HORS-RÈGLE — SECONDE "
+                            "PASSE (post-rééquilibrage)",
+                            ha_vmids=self.state.ha_vmids,
+                            ha_affinity=self.state.ha_affinity,
+                            ha_affinity_hard=self.state.ha_affinity_hard,
+                            ha_live=True)
+                        self.log.info(
+                            "[rebalance] Seconde passe de rapatriement "
+                            "(post-rééquilibrage) : la place libérée par "
+                            "le rééquilibrage permet de ramener les "
+                            "ressources restées hors règle à la 1re "
+                            "passe — AVANT le dégel, pour que le CRM "
+                            "n'ait rien à corriger")
+                        self._apply_migrations(second, self.state,
+                                               ha_live=True)
+                        # ne retirer du différé QUE si la migration a
+                        # réussi (sinon exception : reste différée ✔)
+                        for p in second:
+                            self.off_rule_vmids.discard(p["vm"].vmid)
+                            self.off_rule_returned.add(p["vm"].vmid)
                 finally:
                     self.log.info("[rebalance] Dégel CRM : restauration "
                                   "des ressources HA dans leur état "
@@ -5555,7 +6996,27 @@ class Updater:
                 f"constant, non résorbé par ce run")
 
     def final_report(self):
-        print_occupancy_table(self.log, self.state, "ÉTAT FINAL DU CLUSTER")
+        # v9 : en dry-run l'état final est SIMULÉ — sa « RAM (pression) »
+        # est la pression DÉCLARÉE du modèle (égale à « Σ déclarée »),
+        # pas un usage mesuré. Sans ce NB, comparer l'état initial
+        # (« RAM réelle » ~50 %) à l'état final (« pression » ~85 %)
+        # laissait croire que la mémoire des nœuds avait gonflé, alors
+        # qu'une migration DÉPLACE la mémoire, elle ne la crée pas.
+        # En run réel ayant touché le cluster, l'état est re-lu après
+        # la fenêtre de stabilité CRM (simulated=False) : pas de NB.
+        note = None
+        if self.state.simulated:
+            note = (
+                "« RAM (pression) » = Σ RAM max DÉCLARÉE des guests "
+                "running du modèle, muté par les migrations "
+                + ("SIMULÉES (dry-run)" if self.dry else "appliquées")
+                + " — PAS une consommation mesurée. Comparez-la à "
+                "« Σ déclarée » de l'état initial (même métrique), pas "
+                "à « RAM réelle » : une migration déplace la mémoire, "
+                "elle ne la crée pas ; l'usage réel du nœud ne peut pas "
+                "être simulé.")
+        print_occupancy_table(self.log, self.state, "ÉTAT FINAL DU CLUSTER",
+                              note=note)
         gap = pressure_gap(self.state)
         if gap is not None:
             thr = rebalance_threshold(self.state)
@@ -5576,9 +7037,11 @@ class Updater:
         if self.off_rule_returned:
             self.log.info(
                 f"{len(self.off_rule_returned)} ressource(s) HA repliée(s) "
-                f"hors règle (strict=0) pendant l'évacuation, puis "
+                f"ou déplacée(s) hors règle pendant l'Étape 1 (repli "
+                f"strict=0 ou sommeil des règles), puis "
                 f"RAPATRIÉE(S) sur un nœud de leur règle pendant le "
-                f"rééquilibrage final : dégel cohérent, le CRM n'a rien "
+                f"rééquilibrage final (1re passe, ou 2e passe "
+                f"post-rééquilibrage) : dégel cohérent, le CRM n'a rien "
                 f"à corriger ✔ ("
                 + ", ".join(sorted(str(v) for v in self.off_rule_returned))
                 + ")")
@@ -5608,11 +7071,11 @@ class Updater:
             back_home = sorted(set(self.off_rule_vmids) - set(still_off))
             if back_home:
                 self.log.info(
-                    f"{len(back_home)} ressource(s) HA repliée(s) hors "
-                    f"règle (strict=0) pendant ce run, puis rentrée(s) "
-                    f"d'elles-mêmes sur un nœud de leur règle (placement "
-                    f"normal des évacuations suivantes) — déjà chez "
-                    f"elles à la fin du run, le CRM n'aura rien à "
+                    f"{len(back_home)} ressource(s) HA repliée(s) ou "
+                    f"déplacée(s) hors règle pendant ce run, puis "
+                    f"rentrée(s) d'elles-mêmes sur un nœud de leur règle "
+                    f"(placement normal des évacuations suivantes) — déjà "
+                    f"chez elles à la fin du run, le CRM n'aura rien à "
                     f"corriger ✔ ("
                     + ", ".join(str(v) for v in back_home) + ")")
             if still_off:
@@ -5623,9 +7086,32 @@ class Updater:
                     + " — le CRM va probablement les rapatrier vers "
                     "leurs nœuds préférés : c'est ATTENDU, pas une "
                     "anomalie.")
+        # Filet général : TOUTE ressource HA encore hors de sa règle
+        # node-affinity à la fin du run (dure OU soft) — y compris les
+        # déplacées pendant le sommeil des règles et non rapatrieables
+        # (aucun nœud de règle ne respectait la marge RAM/CPU, cf. le
+        # WARNING émis au moment du rapatriement). Le CRM agira au
+        # dégel : certain pour une règle DURE, probable pour une soft.
+        still_hors = sorted(hors_rule_vmids(self.state))
+        if still_hors:
+            n_hard = sum(1 for v in still_hors
+                         if v in self.state.ha_affinity_hard)
+            self.log.warning(
+                f"{len(still_hors)} ressource(s) HA encore HORS de "
+                f"leur règle node-affinity à la fin du run ("
+                + ", ".join(str(v) for v in still_hors)
+                + f") — dont {n_hard} sous règle DURE (strict=1 : "
+                "relocalisation CRM certaine au dégel ; les soft : "
+                "probable). Comportement ATTENDU (marge RAM/CPU "
+                "insuffisante sur les nœuds de règle au moment du "
+                "rapatriement), pas une anomalie.")
         if self.dry:
             self.estimation_report()
-            self.log.info("✅ DRY-RUN terminé — aucune action réelle n'a été exécutée.")
+            self.log.info("✅ DRY-RUN terminé — migrations/upgrades/reboots "
+                          "SIMULÉS ; seules les règles node-affinity ont été "
+                          "réellement désactivées puis réactivées (test du "
+                          "mécanisme, sans effet sur des placements "
+                          "conformes).")
 
     # ---------- point d'entrée ----------
     def run(self, only_node: Optional[str]):
@@ -5658,6 +7144,13 @@ class Updater:
                 self._state_write()
             for idx, node in enumerate(nodes, 1):
                 self.update_node(node, f"{idx}/{len(nodes)}")
+            # FIN de l'Étape 1 : réactivation des règles node-affinity
+            # désactivées au premier nœud — AVANT le rapatriement
+            # (--node) / le rééquilibrage et le plan de failback des
+            # hors-règle, qui redeviennent contraints par les règles
+            # (dégel final cohérent : le CRM n'a pas de vague de
+            # relocate à corriger en pleine Étape 2).
+            self._ha_rules_restore_all(self.state)
             # Rééquilibrage global uniquement en run complet : avec --node,
             # on rapatrie à la place les VMs évacuées vers leur nœud d'origine.
             if only_node:
@@ -5704,6 +7197,19 @@ class Updater:
                         self._state_write()
                     except Exception as ee:
                         self.log.error(f"Impossible de sortir {n} du mode maintenance : {ee}")
+            # Filet de sécurité règles node-affinity : un run complet qui
+            # échoue en pleine Étape 1 ne doit pas laisser les règles
+            # désactivées sur le cluster jusqu'au prochain run — le
+            # fichier d'état couvrirait, mais autant restaurer tout de
+            # suite (le CRM reprend ses préférences le plus tôt possible).
+            # Dry-run inclus : les désactivations y sont RÉELLES.
+            if self.ha_rules_snapshot:
+                try:
+                    self._ha_rules_restore_all(self.state)
+                except Exception as ee:
+                    self.log.error(f"Réactivation des règles node-affinity "
+                                   f"impossible ({ee}) — le prochain run la "
+                                   f"fera via le fichier d'état.")
             # STATISTIQUES : fusion des durées réelles mesurées pendant ce
             # run dans .proxmox-rolling-update.stats — dans le finally,
             # donc MÊME un run partiel (erreur en cours de route, sortie
@@ -5795,6 +7301,9 @@ def main():
         except OSError as e:
             logger.warning(f"Fichier de log '{env_log_file}' inutilisable ({e}) "
                            f"— poursuite sans log fichier.")
+    # PREMIÈRE ligne de chaque run (console ET fichier de log) : la version
+    # du script, pour identifier sans ambiguïté la copie qui s'exécute.
+    logger.info(f"proxmox-rolling-update — version {SCRIPT_VERSION}")
     # Relecture des constantes maintenant que l'environnement est chargé
     # (elles ont été évaluées avant le chargement du fichier d'env).
     global API_HOST, API_HOSTS, API_USER, API_TOKEN_NAME, API_TOKEN_VALUE, VERIFY_SSL
@@ -5892,7 +7401,7 @@ def main():
     logger.info(f"Passphrase SSH        : "
                 f"{'définie via PVE_SSH_PASSPHRASE' if SSH_KEY_PASSPHRASE else 'absente (aucune invite si la clé est nue)'}")
     dry = args.dry_run
-    banner(logger, f"PROXMOX ROLLING UPDATE — mode {'DRY-RUN (simulation)' if dry else 'EXÉCUTION RÉELLE'}",
+    banner(logger, f"PROXMOX ROLLING UPDATE v{SCRIPT_VERSION} — mode {'DRY-RUN (simulation)' if dry else 'EXÉCUTION RÉELLE'}",
            ColorFormatter.GREEN if dry else "\033[91;1m")
 
     # Le client Proxmox est instancié dans TOUS les cas : l'inventaire du

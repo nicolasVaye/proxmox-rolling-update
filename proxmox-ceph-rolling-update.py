@@ -47,10 +47,44 @@ Trois actions MUTUELLEMENT EXCLUSIVES :
 
 SÉCURITÉ — flags de maintenance Ceph : avant toute action, le script
 pose noout, norecover, norebalance, nobackfill, noscrub, nodeep-scrub
-(seulement ceux qu'il pose lui-même, les vôtres sont conservés), et
+(seulement ceux qu'il pose lui-même ; les orphelins d'un run précédent
+interrompu sont ADOPTÉS puis retirés, les vôtres sont conservés), et
 les RETIRE dans le bloc finally — même en cas d'abort. Un fichier
 d'état JSON trace les flags et la progression (reprise possible pour
 --rotate-keys : les entités déjà migrées sont re-détectées et sautées).
+Gates PENDANT la fenêtre : santé OK + quorum + PGs ACTIVES + OSDs
+'up' — « clean » n'est pas exigible tant que nos flags gèlent le
+backfill (une PG « active+remapped » au retour d'une OSD est normale) ;
+la convergence complète (active+clean) est vérifiée par la
+CONVERGENCE FINALE, APRÈS le retrait des flags (avertissement sans
+abort si le backfill est encore en cours : le run a réussi).
+
+ANTI-BRUIT : les gates interrogent la santé du cluster à intervalle
+régulier (PVE_CEPH_POLL_S, défaut 15 s) et à chaque unité redémarrée —
+une santé IDENTIQUE à la précédente n'est PAS redumpée, et le
+diagnostic est réimprimé dès que les dégradations CHANGENT (le message
+de convergence NOMME au contraire les checks qui bloquent encore). Le
+diagnostic n'affiche que les dégradations BLOQUANTES : les checks
+AUTH_INSECURE_* tolérés (avertissement cephx dédié, imprimé une seule
+fois par changement) et OSDMAP_FLAGS de maintenance (posés par le run
+lui-même) sont masqués ; sur les chemins d'échec (abort, timeout de
+gate), le contexte complet est réimprimé de force.
+
+PHASE E — DÉFAUT ET OPT-IN : la version COURANTE de chaque daemon
+OSD (« ceph osd metadata ») est lue avant la passe — un nœud dont
+TOUTES les OSDs tournent déjà sur la release cible est SAUTÉ (un
+daemon qui TOURNE sur la cible a nécessairement été redémarré APRÈS
+l'upgrade des paquets : c'est une preuve, pas une hypothèse) ; sinon
+ses OSDs sont redémarrées d'un coup via « systemctl restart
+ceph-osd.target » (une seule gate par nœud — plus rapide, mais
+pendant le restart AUCUNE OSD du nœud ne sert d'IO : les réplicas
+des autres nœuds maintiennent le service, min_size ≥ 2 requis).
+Le test du sharding RocksDB par OSD (piège META du wiki — il exige
+l'arrêt INDIVIDUEL de chaque OSD) est un OPT-IN explicite :
+« --force-detection-sharding » redémarre les OSDs UNE PAR UNE (arrêt
+→ show-sharding → démarrage), sans exemption de version ; la date
+de création des répertoires (préflight) n'est qu'une HEURISTIQUE,
+la vérité terrain est ce test.
 
 Mode dry-run (--dry-run) : n'exécute RIEN qui modifie le cluster.
 L'inventaire et les gates de l'ÉTAPE 0 sont de pures lectures (API +
@@ -87,11 +121,12 @@ import json
 import logging
 import os
 import re
+import shlex
 import socket
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION — à adapter à votre plateforme
@@ -103,7 +138,10 @@ from typing import Dict, List, Optional, Tuple
 
 
 def _env(name: str, default: str) -> str:
-    return os.environ.get(name, default)
+    # Une variable DÉFINIE MAIS VIDE compte comme absente (sinon
+    # PVE_CEPH_STATE_FILE= (ligne vide d'un env) donne un chemin ''
+    # et float(_env("PVE_EST_*", …)) lève ValueError).
+    return os.environ.get(name) or default
 
 
 # --- Connexion (mêmes variables que proxmox_rolling_update.py) -------------
@@ -125,14 +163,36 @@ SSH_KEY_PASSPHRASE = _env("PVE_SSH_PASSPHRASE", "")
 SSH_RETRIES = int(_env("PVE_SSH_RETRIES", "3"))
 
 # --- Gates / attentes Ceph -------------------------------------------------
-# Timeout global d'attente de stabilisation (santé OK + PGs active+clean)
-# après chaque redémarrage de daemon / nœud.
+# Timeout global d'attente de stabilisation (santé OK + quorum + PGs
+# ACTIVES — cf. wait_ceph_stable : « clean » n'est exigé qu'après le
+# retrait des flags, via la convergence finale) après chaque
+# redémarrage de daemon / nœud.
 CEPH_STABLE_TIMEOUT = int(_env("PVE_CEPH_STABLE_TIMEOUT", "1800"))
-# Nombre MAXIMAL de PGs tolérées hors « active+clean » pour passer une gate
-# (0 = exigence stricte : toutes les PGs doivent être propres).
-CEPH_MAX_DEGRADED_PGS = int(_env("PVE_CEPH_MAX_DEGRADED_PGS", "0"))
+# Convergence FINALE (active+clean) après le retrait des flags : le
+# backfill/recovery gelé pendant la fenêtre reprend — il peut être
+# long sur un cluster chargé ; au timeout le run a de toute façon
+# RÉUSSI (simple avertissement, le cluster converge tout seul).
+FINAL_CONVERGE_TIMEOUT = int(_env("PVE_CEPH_FINAL_CONVERGE_TIMEOUT",
+                                  str(CEPH_STABLE_TIMEOUT)))
 # Période de poll des gates (s).
 CEPH_POLL_S = int(_env("PVE_CEPH_POLL_S", "15"))
+# Attente des vérifications post-restart qui dépendent du CONSENSUS :
+# mise à jour AUTOMATIQUE de la monmap (min_mon_release) après le
+# retour du dernier MON, élection du MGR actif. Ces mises à jour
+# prennent quelques secondes — un check immédiat lirait l'ancien
+# état et avorterait le run à tort (vécu : mons tous en tentacle,
+# monmap encore à l'epoch précédente une seconde après le restart).
+ELECTION_TIMEOUT_S = float(_env("PVE_CEPH_ELECTION_TIMEOUT_S", "300"))
+# Attente des vérifications « check AUTH_INSECURE_* disparu » de
+# --rotate-keys : le health check est RECALCULÉ ASYNCHRONEMENT par
+# les mons — une lecture immédiate peut relire l'état d'AVANT la
+# dernière rotation (vécu 11:02 : FATAL « mds.v-testprox03-C » 7 s
+# après SON restart, alors que le check avait disparu à la lecture
+# SUIVANTE, une seconde plus tard). On POLL donc avant de déclarer
+# FATAL (le message d'échec reste ce qu'il était : run relançable,
+# reprise au prochain run).
+ROTATE_CHECK_TIMEOUT_S = float(_env("PVE_CEPH_ROTATE_CHECK_TIMEOUT_S",
+                                   "120"))
 # Utilisation globale du cluster (%) au-delà de laquelle on ne fait RIEN :
 # un upgrade qui tourne mal sur un cluster presque plein = recovery très long.
 CEPH_UTIL_MAX_PCT = float(_env("PVE_CEPH_UTIL_MAX_PCT", "85"))
@@ -145,6 +205,21 @@ CEPH_UTIL_MAX_PCT = float(_env("PVE_CEPH_UTIL_MAX_PCT", "85"))
 # NB : 'noup'/'nodown' volontairement EXCLUS (ils masquent les pannes réelles).
 CEPH_MAINT_FLAGS = ("noout", "norecover", "norebalance",
                     "nobackfill", "noscrub", "nodeep-scrub")
+
+# --- Checks PG gelés par les flags de maintenance ---------------------------
+# Checks WARN générés par le GEL du recovery/backfill/scrub PENDANT la
+# fenêtre de maintenance : une PG « active+degraded » ou
+# « active+undersized » (ex. vécu : PG « stuck peering » de longue date
+# ressortie dégradée au retour d'une OSD) ne PEUT PAS guérir tant que
+# norecover/nobackfill sont posés, et noscrub/nodeep-scrub gèlent aussi
+# les checks de scrubs en retard. Les compter dans la santé effective
+# aux gates = attente GARANTIE jusqu'au timeout (vécu : osd.16, 14 min
+# de polls « 0 PG non active » alors que tout était opérationnel).
+# Comme « non clean », ces checks sont donc attendus PENDANT la fenêtre
+# uniquement (cf. ProxmoxClient.ceph_set_maintenance_window) ; la
+# convergence finale, APRÈS le retrait des flags, les vérifie réellement.
+CEPH_PG_FROZEN_CHECKS = ("PG_DEGRADED", "PG_UNDERSIZED",
+                         "PG_NOT_SCRUBBED", "PG_NOT_DEEP_SCRUBBED")
 
 # --- Fichier d'état (reprise après interruption) ---------------------------
 STATE_FILE = _env("PVE_CEPH_STATE_FILE", "/var/lib/proxmox-ceph-updater/state.json")
@@ -695,21 +770,44 @@ class ProxmoxClient:
                        "-o Dpkg::Options::=--force-confold",
                   stream=True)
 
-    def ceph_pkg_pending(self, node: str) -> List[Tuple[str, str]]:
-        """Paquets Ceph en attente de mise à jour sur un nœud (simulation
-        apt -s, lecture pure) : [(nom, version_cible)]."""
+    def apt_sim_all(self, node: str) -> Optional[Tuple[List[Tuple[str, str]],
+                                                       List[str]]]:
+        """Simulation « apt-get -s full-upgrade » (lecture pure —
+        rien n'est installé ni retiré). Retourne (paquets Ceph
+        [(nom, version_cible)], autres paquets [noms]) ou None si la
+        sortie apt est ILLISIBLE (échec ssh/apt) : l'appelant peut
+        distinguer « rien à faire » de « je ne sais pas »."""
         try:
             out = self._ssh(node, "DEBIAN_FRONTEND=noninteractive "
                                   "apt-get -s full-upgrade -q")
         except Exception:
-            return []
-        pkgs: List[Tuple[str, str]] = []
+            return None
+        ceph: List[Tuple[str, str]] = []
+        others: List[str] = []
         for m in re.finditer(r"^Inst (\S+) \((\S+)", out, re.M):
             name = m.group(1)
             if re.search(r"^(ceph|rados|librbd|libcephfs|librados|"
                          r"python3-rbd|python3-cephfs|rbd-nbd)", name):
-                pkgs.append((name, m.group(2)))
-        return pkgs
+                ceph.append((name, m.group(2)))
+            else:
+                others.append(name)
+        return (ceph, others)
+
+    def ceph_pkg_pending(self, node: str,
+                         others: Optional[List[str]] = None
+                         ) -> List[Tuple[str, str]]:
+        """Paquets Ceph en attente de mise à jour sur un nœud (simulation
+        apt -s, lecture pure) : [(nom, version_cible)]. Si `others` est
+        fourni (liste à remplir), il reçoit les paquets NON-Ceph que le
+        « apt-get full-upgrade » du script mettrait AUSSI à jour
+        (full-upgrade est global, pas limité à Ceph)."""
+        res = self.apt_sim_all(node)
+        if res is None:
+            return []
+        ceph, oth = res
+        if others is not None:
+            others.extend(oth)
+        return ceph
 
     # ---------- Santé Ceph (adapté du script PVE) ----------
     def ceph_status(self) -> Optional[Dict]:
@@ -730,21 +828,147 @@ class ProxmoxClient:
     def _ceph_allow_auth_insecure() -> bool:
         return str(_env("PVE_CEPH_ALLOW_AUTH_INSECURE", "0")) == "1"
 
+    @staticmethod
+    def _osdmap_flags_all_maintenance(chk: Dict) -> bool:
+        """True si le check OSDMAP_FLAGS signale EXCLUSIVEMENT des
+        flags de maintenance (CEPH_MAINT_FLAGS) — posés par ce run ou
+        par un administrateur pour une fenêtre de maintenance
+        volontaire. Le WARN correspondant n'est PAS une dégradation
+        réelle : pendant tout le run ces flags sont posés, et la
+        santé ne peut JAMAIS revenir à HEALTH_OK avant leur retrait —
+        sans ce filtrage, chaque gate attendrait son timeout (30 min)
+        puis échouerait. Un flag NON-maintenance (pause, full, noup,
+        nodown, in…) reste compté comme dégradation."""
+        try:
+            msg = str((chk.get("summary") or {}).get("message") or "")
+        except Exception:
+            return False
+        m = re.match(r"(.*?)\s*flag\(s\)\s*set", msg.strip())
+        if not m:
+            return False
+        flags = [f.strip() for f in m.group(1).split(",") if f.strip()]
+        return bool(flags) and all(f in CEPH_MAINT_FLAGS for f in flags)
+
+    def _osd_upgrade_finished_expected(self, chk: Dict) -> bool:
+        """True si le check OSD_UPGRADE_FINISHED (« all OSDs are
+        running tentacle or later but require_osd_release <
+        tentacle ») signale la release CIBLE du run en cours. C'est
+        le signal du monitor que la mise à jour des OSDs est
+        TERMINÉE — il ne disparaît QUE quand « require_osd_release »
+        est relevé, ce que CE run fait en Phase G (après les MDS,
+        ordre du wiki). L'exiger HEALTH_OK à la gate de la Phase E
+        condamnait le run à un timeout GARANTI : le check ne PEUT
+        PAS disparaître avant la commande que le run n'exécute
+        qu'à la FIN (vécu 09:12 : restart ceph-osd.target, OSDs
+        up/quorum complet/PGs actives tous OK, > 5 min de polls
+        sur ce SEUL check restant, run tué au Ctrl-C avant la
+        phase MDS). Toléré si et seulement si la release nommée est
+        la CIBLE du run (--major) : pas de cible (modes mineur /
+        rotate-keys) ou release différente (montée précédente
+        inachevée) → reste BLOQUANT (diagnostic affiché, preflight
+        refusé). La Phase G pose require-osd-release → le check
+        disparaît → la convergence finale le vérifie pour de vrai."""
+        target = getattr(self, "_osd_require_target", "") or ""
+        if not target:
+            return False
+        try:
+            msg = str((chk.get("summary") or {}).get("message") or "")
+        except Exception:
+            return False
+        return f"running {target} or later" in msg
+
+    def ceph_set_maintenance_window(self, on: bool) -> None:
+        """Marque l'ouverture/fermeture de la fenêtre de maintenance de
+        CE run (nos flags à nous) : PENDANT la fenêtre, les checks PG
+        gelés par norecover/nobackfill/noscrub
+        (CEPH_PG_FROZEN_CHECKS — PG dégradée/undersized qui ne PEUT
+        PAS guérir avant le retrait des flags) sont attendus et
+        comptés hors dégradation, comme « non clean ». NB : depuis la
+        reprise 09:01 (2 PG « active+recovery_wait+degraded » + flags
+        déjà posés sur le cluster → preflight REFUSÉ alors que rien
+        n'était guérissable), la tolérance s'applique aussi HORS
+        fenêtre dès que le statut porte un OSDMAP_FLAGS
+        exclusivement-maintenance (flags posés, quel que soit l'auteur)
+        — cf. _health_parts ; la convergence finale re-vérifie après
+        le retrait."""
+        self._maint_window = bool(on)
+
+    def _health_parts(self, st: Optional[Dict]) -> Tuple[str, Tuple[str, ...],
+                                                        Set[str], Dict]:
+        """Classification commune des checks de santé — utilisée par la
+        santé effective, le diagnostic et les gates (une seule source
+        de vérité). Retourne (status, ignored_AUTH, skipped_attendus,
+        blocking) :
+        - ignored : AUTH_INSECURE_* si (et seulement si)
+          PVE_CEPH_ALLOW_AUTH_INSECURE=1 (avertissement cephx dédié) ;
+        - skipped (sans ignored, ajoutés en plus) : OSDMAP_FLAGS
+          exclusivement-maintenance, les checks PG gelés par les
+          flags (CEPH_PG_FROZEN_CHECKS) DÈS QUE des flags de
+          maintenance sont posés — par ce run (fenêtre) OU déjà
+          présents sur le cluster (admin/run interrompu : le check
+          OSDMAP_FLAGS du même statut en est la preuve) : tant que
+          norecover/nobackfill gèlent le recovery, une PG
+          « active+recovery_wait+degraded » NE PEUT PAS guérir, et
+          l'exiger condamne preflight et gates à un refus/timeout
+          éternels (vécu : reprise 09:01, 2 PG recovery_wait + flags
+          posés → REFUSÉ au preflight alors que rien n'est guérissable
+          avant leur retrait) ; et OSD_UPGRADE_FINISHED quand il
+          signale la release CIBLE du run (--major :
+          _osd_upgrade_finished_expected) : toutes les OSDs
+          tournent déjà en cible mais « require_osd_release » n'est
+          relevé qu'en Phase G (après les MDS) — l'exiger aux gates
+          de la Phase E attendait une condition que le run
+          lui-même ne crée qu'à la fin (vécu 09:12 : > 5 min de
+          polls, run tué au Ctrl-C avant la phase MDS) ;
+        - blocking : tout le reste, qui compte dans la santé effective
+          et doit être résolu avant de poursuivre. La convergence
+          finale, APRÈS retrait des flags, re-vérifie les checks PG
+          pour de vrai (hors flags ils redeviennent bloquants)."""
+        h = (st.get("health") or {})
+        status = h.get("status", "?")
+        checks = h.get("checks") or {}
+        ignored = tuple(sorted(
+            c for c in checks
+            if c.startswith(self.CEPH_AUTH_INSECURE_PREFIX)))
+        if ignored and not self._ceph_allow_auth_insecure():
+            ignored = ()
+        skipped = set(ignored)
+        maint_flags_set = False
+        for c in checks:
+            if (c == "OSDMAP_FLAGS"
+                    and self._osdmap_flags_all_maintenance(checks[c])):
+                skipped.add(c)
+                maint_flags_set = True
+            if (c == "OSD_UPGRADE_FINISHED"
+                    and self._osd_upgrade_finished_expected(checks[c])):
+                skipped.add(c)
+        if maint_flags_set or getattr(self, "_maint_window", False):
+            for c in checks:
+                if c in CEPH_PG_FROZEN_CHECKS:
+                    skipped.add(c)
+        blocking = {c: v for c, v in checks.items() if c not in skipped}
+        return status, ignored, skipped, blocking
+
     def ceph_effective_health(self, st: Optional[Dict]) -> Tuple[str, Tuple[str, ...]]:
-        """(santé effective, codes ignorés) : recompte la santé après
-        filtrage des checks AUTH_INSECURE_* si (et seulement si)
-        PVE_CEPH_ALLOW_AUTH_INSECURE=1."""
+        """(santé effective, codes AUTH tolérés) : recompte la santé
+        après filtrage des checks « attendus » (cf. _health_parts) :
+        AUTH_INSECURE_* si PVE_CEPH_ALLOW_AUTH_INSECURE=1 — retournés
+        dans `ignored` (le log cephx les affiche) ; OSDMAP_FLAGS
+        silencieusement quand il signale EXCLUSIVEMENT des flags de
+        maintenance ; les checks PG gelés par le recovery/backfill/scrub
+        dès que des flags de maintenance sont posés (fenêtre de ce run
+        OU déjà présents sur le cluster) ; et OSD_UPGRADE_FINISHED
+        quand il nomme la release CIBLE du run --major (toutes les
+        OSDs en cible, require-osd-release relevé plus tard par ce
+        même run). HORS flags, une PG dégradée
+        reste bloquante : le preflight doit la voir, et la convergence
+        finale la re-vérifie après le retrait."""
         if st is None:
             return "?", ()
-        h = (st.get("health") or {})
-        health = h.get("status", "?")
-        checks = h.get("checks") or {}
-        ignored = tuple(sorted(c for c in checks
-                               if c.startswith(self.CEPH_AUTH_INSECURE_PREFIX)))
-        if not ignored or not self._ceph_allow_auth_insecure():
-            return health, ()
-        remaining = [c for c in checks.items() if c[0] not in ignored]
-        sevs = [str((c or {}).get("severity", "")) for _, c in remaining]
+        _, ignored, skipped, blocking = self._health_parts(st)
+        if not skipped:
+            return (st.get("health") or {}).get("status", "?"), ()
+        sevs = [str((c or {}).get("severity", "")) for c in blocking.values()]
         if any("ERR" in sev for sev in sevs):
             return "HEALTH_ERR", ignored
         if any("WARN" in sev for sev in sevs):
@@ -752,6 +976,15 @@ class ProxmoxClient:
         return "HEALTH_OK", ignored
 
     def ceph_log_auth_insecure(self, ignored: Tuple[str, ...]) -> None:
+        """Avertissement cephx (CVE-2025-30156) — imprimé SEULEMENT
+        quand l'ensemble des codes tolérés CHANGE : ces codes sont
+        identiques à CHAQUE interrogation de santé (preflight, chaque
+        gate, chaque poll de 15 s) ; les répéter à chaque arrêt /
+        redémarrage d'OSD noyait les messages de convergence."""
+        sig = tuple(ignored)
+        if sig == getattr(self, "_auth_insecure_sig", None):
+            return
+        self._auth_insecure_sig = sig
         self.log.warning(
             f"[Ceph] PVE_CEPH_ALLOW_AUTH_INSECURE=1 : {len(ignored)} "
             f"check(s) de sécurité cephx toléré(s) ({', '.join(ignored)}) — "
@@ -759,20 +992,55 @@ class ProxmoxClient:
             f"impact IO/daemons. Remédiation définitive : --rotate-keys "
             f"(migration des clés vers « aes256k »).")
 
-    def ceph_diagnose(self, st: Optional[Dict]) -> None:
+    def ceph_diagnose(self, st: Optional[Dict],
+                      force: bool = False) -> None:
+        """Dump des dégradations BLOQUANTES, sans le bruit attendu :
+        les checks AUTH_INSECURE_* tolérés (avertissement cephx dédié,
+        imprimé une seule fois), OSDMAP_FLAGS exclusivement de
+        maintenance (posés par le run lui-même) et — pendant la
+        fenêtre — les checks PG gelés par les flags sont MASQUÉS ; les
+        redumper ~40 lignes à chaque gate de la Phase E (une par OSD,
+        polls de 15 s) noyait l'information principale (OSD down, PG
+        non active…). Un diagnostic IDENTIQUE au précédent n'est PAS
+        réimprimé ; appelé à CHAQUE poll, il ne réapparaît que si les
+        dégradations CHANGENT (`force=True` : contexte complet forcé
+        sur les chemins d'échec/abort)."""
         if st is None:
             return
-        h = (st.get("health") or {})
-        if h.get("status", "?") == "HEALTH_OK":
+        status, _ignored, skipped, blocking = self._health_parts(st)
+        if status == "HEALTH_OK" and not blocking:
             return
-        status = h.get("status", "?")
-        self.log.warning(f"[Ceph] Diagnostic ({status}) :")
-        checks = h.get("checks") or {}
-        if not checks:
-            self.log.warning("    aucun détail dans le status — consultez "
-                             "« ceph -s » / « ceph health detail » sur un nœud.")
+        sig: List[tuple] = []
+        for code, c in sorted(blocking.items()):
+            sig.append((code, str(c.get("severity", "?")),
+                        str(((c.get("summary") or {}).get("message")
+                             or "")).strip(),
+                        tuple(str((d.get("message") or "")).strip()
+                              .replace("\n", " ")[:200]
+                              for d in (c.get("detail") or [])[:6])))
+        sig = tuple(sig)
+        if sig == getattr(self, "_diag_sig", None) and not force:
             return
-        for code, c in sorted(checks.items()):
+        self._diag_sig = sig
+        header = f"[Ceph] Diagnostic ({status}"
+        if skipped:
+            header += f" — hors {len(skipped)} check(s) toléré(s)/attendu(s)"
+        self.log.warning(header + " :")
+        if not blocking:
+            if skipped:
+                self.log.warning(
+                    "    aucune dégradation BLOQUANTE — les check(s) "
+                    "présents sont tolérés (AUTH_INSECURE_*) ou "
+                    "attendus (flags de maintenance / PG gelées par "
+                    "le recovery) ; cause de l'attente ci-dessous "
+                    "(quorum, PGs, OSDs).")
+            else:
+                self.log.warning(
+                    "    santé dégradée sans détail de check — consultez "
+                    "« ceph -s » / « ceph health detail » sur un nœud ; "
+                    "cause de l'attente ci-dessous (quorum, PGs, OSDs).")
+            return
+        for code, c in sorted(blocking.items()):
             sev = c.get("severity", "?")
             msg = ((c.get("summary") or {}).get("message") or "").strip()
             self.log.warning(f"    {code} [{sev}] : {msg}")
@@ -782,19 +1050,43 @@ class ProxmoxClient:
                     self.log.warning(f"        {dm[:200]}")
 
     # ---------- Commandes Ceph via SSH ----------
+    @staticmethod
+    def _json_lenient(out: str) -> Optional[object]:
+        """Décode le PREMIER objet JSON d'une sortie qui comporte du
+        texte APRÈS lui. Cas vécu (cluster réel, 09:35) : « ceph fs
+        dump -f json » imprime le JSON compact sur SA première ligne,
+        puis une ligne vide, puis « dumped fsmap epoch N » — le
+        json.loads() intégral échouait avec « Extra data: line 3
+        column 1 (char …) » et le run --execute avortait en Phase F
+        (« MDS actives illisibles », refus d'arrêter les MDS à
+        l'aveugle) alors que le JSON était parfaitement valide.
+        raw_decode lit le PREMIER objet et ignore le reste ; None si
+        la sortie ne commence pas par du JSON."""
+        try:
+            return json.loads(out)
+        except ValueError:
+            pass
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(out.lstrip())
+            return obj
+        except ValueError:
+            return None
+
     def ceph_json(self, cmd: str, node: Optional[str] = None) -> Dict:
         """Exécute une commande ceph --format json (lecture pure) et
-        décode le JSON. `node` facultatif : sinon premier nœud joignable."""
+        décode le JSON (tolérant aux lignes traînées après l'objet,
+        cf. _json_lenient). `node` facultatif : sinon premier nœud
+        joignable."""
         cmdj = cmd if "--format" in cmd else f"{cmd} --format json"
         if node:
             out = self._ssh(node, cmdj)
         else:
             _, out = self.ssh_any(cmdj)
-        try:
-            return json.loads(out)
-        except ValueError as e:
+        data = self._json_lenient(out)
+        if data is None:
             raise RuntimeError(f"Sortie non-JSON de « {cmd} » : "
-                               f"{out.strip()[:200]} ({e})")
+                               f"{out.strip()[:200]}")
+        return data
 
     def ceph_run(self, cmd: str, node: Optional[str] = None,
                  stream: bool = False) -> str:
@@ -819,10 +1111,19 @@ class ProxmoxClient:
         except Exception:
             return None
 
-    def ceph_maintenance_on(self) -> Dict[str, bool]:
+    def ceph_maintenance_on(self,
+                            adopted: Optional[List[str]] = None
+                            ) -> Dict[str, bool]:
         """Pose les flags de maintenance (globaux au cluster). Retourne
-        UNIQUEMENT les flags posés par CE RUN — les flags déjà posés par
-        l'administrateur ne sont ni touchés ni retirés."""
+        UNIQUEMENT les flags NOUVELLEMENT posés par CE RUN ; les flags
+        déjà posés ne sont ni reposés ni retirés ICI — leur revente
+        en fin de run est portée par l'appelant via `flags_we_set`
+        (flags adoptés d'un run précédent + flags posés ici). Un
+        flag déjà posé et signalé dans `adopted` (orphelin d'un run
+        précédent interrompu) est loggé comme ADOPTÉ — les autres
+        sont considérés posés par un administrateur et laissés
+        intacts."""
+        adopted = set(adopted or ())
         cur = self.ceph_flags_current()
         if cur is None:
             raise RuntimeError("Impossible de lire les flags Ceph — "
@@ -830,7 +1131,13 @@ class ProxmoxClient:
         changed: Dict[str, bool] = {}
         for f in CEPH_MAINT_FLAGS:
             if f in cur:
-                self.log.info(f"[Ceph] flag {f} déjà posé (admin) — conservé.")
+                if f in adopted:
+                    self.log.info(f"[Ceph] flag {f} déjà posé — ADOPTÉ "
+                                  f"(run précédent interrompu), sera "
+                                  f"retiré à la fin de celui-ci.")
+                else:
+                    self.log.info(f"[Ceph] flag {f} déjà posé (admin) — "
+                                  f"conservé.")
                 continue
             self.ceph_run(f"ceph osd set {f}")
             changed[f] = True
@@ -916,16 +1223,28 @@ class ProxmoxClient:
 
     def osd_up_status(self) -> Dict[int, Dict]:
         """{osd_id: {'up': bool, 'in': bool}} via « ceph osd dump ».
-        Lecture pure."""
+        Format RÉEL du dump (vérifié sur cluster vivant, squid ET
+        tentacle) : chaque OSD est identifiée par le champ « osd »
+        (PAS « id » — une lecture par « id » rangeait TOUTES les OSDs
+        sous la seule clé -1 : la gate OSD n'apercevait alors JAMAIS
+        les ids attendues et attendait indéfiniment des OSDs pourtant
+        'up', santé HEALTH_OK). L'état vient de « state » (liste
+        ["exists", "up"] ou chaîne « exists,up ») avec secours sur
+        les entiers legacy « up »/« in » (0/1). Lecture pure."""
         dump = self.ceph_json("ceph osd dump")
         res: Dict[int, Dict] = {}
         for o in dump.get("osds", []):
+            oid = int(o.get("osd", o.get("id", -1)))
             raw = o.get("state", "")
             states = (raw if isinstance(raw, list)
                       else str(raw).replace(",", " ").split())
-            res[int(o.get("id", -1))] = {
-                "up": "up" in states,
-                "in": "exists" in states and "out" not in states,
+            up_i = o.get("up")
+            in_i = o.get("in")
+            res[oid] = {
+                "up": ("up" in states
+                       or (up_i is not None and int(up_i) == 1)),
+                "in": (("exists" in states and "out" not in states)
+                       or (in_i is not None and int(in_i) == 1)),
             }
         return res
 
@@ -954,6 +1273,111 @@ class ProxmoxClient:
             return self.ceph_json("ceph versions")
         except Exception:
             return {}
+
+    def osd_running_versions(self) -> Dict[int, Tuple[int, str]]:
+        """Versions COURANTES des daemons OSD (« ceph osd metadata ») :
+        {osd_id: (majeur, release)}. Un daemon qui TOURNE déjà sur la
+        release cible a nécessairement été redémarré APRÈS l'upgrade
+        des paquets (le processus ne change pas de binaire tout seul)
+        — c'est la preuve de reprise idempotente de la Phase E : cette
+        OSD n'a plus rien à gagner d'un nouveau cycle stop/start.
+        Échec de lecture → {} : échec SÛR, aucune OSD n'est sautée."""
+        try:
+            arr = self.ceph_json("ceph osd metadata")
+        except Exception:
+            return {}
+        out: Dict[int, Tuple[int, str]] = {}
+        if not isinstance(arr, list):
+            return out
+        for m in arr:
+            try:
+                oid = int(str(m.get("id")))
+                ver = str(m.get("ceph_version") or "")
+                rel = str(m.get("ceph_release") or "").strip()
+                mm = re.search(r"(\d+)\.", ver)
+                if mm:
+                    maj = int(mm.group(1))
+                else:
+                    maj = KNOWN_RELEASES.get(rel, 0)
+                if maj:
+                    out[oid] = (maj, rel)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def tell_running_version(self, dtype: str, did: str) -> Tuple[int, str]:
+        """Version COURANTE du PROCESSUS d'un daemon mon/mgr/mds.
+
+        Source 1 : « ceph tell <type>.<id> version » (lecture pure,
+        routée par les mons — exécutable depuis n'importe quel nœud).
+        Sortie réelle : {"version": "ceph version 20.2.5 (hash)
+        tentacle (stable)"} sur sa propre ligne. Limite VÉCUE 10:34 :
+        les mgrs STANDBY ne répondent pas tous au tell — 2 mgrs sur 3
+        déjà en tentacle étaient annoncés « à redémarrer » alors que
+        « ceph versions » les montrait en tentacle — d'où la source 2.
+
+        Source 2 (repli) : « ceph <type> metadata » — JSON listé par
+        le mon pour TOUS les daemons du type, standbys compris
+        (champs « ceph_version_short » ex. 20.2.5 + « ceph_release »
+        ex. tentacle) ; tolérant aux lignes traînées (cf.
+        _json_lenient).
+
+        C'est la contrepartie mons/mgrs/mds de « ceph osd metadata »
+        pour les OSDs : un daemon qui TOURNE déjà sur la release
+        cible a nécessairement été redémarré APRÈS l'upgrade des
+        paquets (le processus ne change pas de binaire tout seul) —
+        le redémarrer de nouveau ne lui apporte RIEN (vécu 09:34 : 3
+        mons et 3 mgrs déjà en tentacle re-redémarrés pour rien à
+        CHAQUE reprise). Retour (0, "") si les DEUX sources restent
+        illisibles (daemon down, sortie inattendue) : l'appelant NE
+        saute PAS le daemon — échec SÛR, on le redémarre
+        (comportement historique du wiki) en le disant dans le log."""
+        # Source 1 : le daemon lui-même répond-il au tell ?
+        try:
+            _, out = self.ssh_any(f"ceph tell {dtype}.{did} version")
+            data = self._json_lenient(out)
+            if isinstance(data, dict):
+                ver, rel = self._parse_daemon_version(
+                    str(data.get("version") or ""))
+                if ver:
+                    return (ver, rel)
+        except Exception:
+            pass
+        # Source 2 (repli) : le mon liste les daemons du type et
+        # leurs versions — répond même quand le tell est ignoré.
+        try:
+            ents = self.ceph_json(f"ceph {dtype} metadata")
+        except Exception:
+            return (0, "")
+        if not isinstance(ents, list):
+            return (0, "")
+        for ent in ents:
+            if not isinstance(ent, dict):
+                continue
+            # identifiant polymorphe : mon/mgr/mds ne rangent pas
+            # le nom au même endroit (« name » vs « id »).
+            if did not in (str(ent.get("id") or ""),
+                           str(ent.get("name") or "")):
+                continue
+            short = str(ent.get("ceph_version_short") or "")
+            m = re.match(r"(\d+)\.", short)
+            if m:
+                return (int(m.group(1)), str(ent.get("ceph_release") or ""))
+            ver, rel = self._parse_daemon_version(
+                str(ent.get("ceph_version") or ""))
+            if ver:
+                return (ver, rel)
+        return (0, "")
+
+    @staticmethod
+    def _parse_daemon_version(ver: str) -> Tuple[int, str]:
+        """(majeure, release) d'une chaîne « ceph version 20.2.5
+        (hash) tentacle (stable) » ; (0, "") si illisible."""
+        m = re.search(r"(\d+)\.", ver)
+        if not m:
+            return (0, "")
+        rm = re.search(r"\)\s+([a-z]+)\s+\(", ver)
+        return (int(m.group(1)), rm.group(1) if rm else "")
 
     def pkg_ceph_version(self, node: str) -> str:
         """Version du paquet Ceph installé sur un nœud (dpkg)."""
@@ -1021,6 +1445,34 @@ class ProxmoxClient:
         except Exception:
             return "?"
 
+    def ceph_repo_files(self, node: str, branch: str) -> List[str]:
+        """Fichiers qui déclarent le dépôt ceph-<branch> sur le nœud
+        (chemins réels). Le nom n'est PAS standardisé (ceph.list,
+        ceph.sources, pveceph.list, /etc/apt/sources.list…) : un sed
+        sur des chemins codés en dur échoue avec le code 2 quand le
+        fichier n'existe pas. Lecture pure, dry-run OK.
+
+        PIÈGE (vécu RHOSPDC, dry-run --major tentacle) : grep sort 2
+        dès qu'UN des chemins passés en ARGUMENT est en erreur (ex.
+        /etc/apt/sources.list ABSENT — c'est le cas d'un nœud migré
+        100 % en .sources deb822), MÊME s'il a trouvé des
+        correspondances : les fichiers trouvés sont déjà imprimés
+        sur stdout, mais _ssh lève sur rc≠0 et l'appelant
+        transformait l'échec en « aucun fichier trouvé » — bascule
+        MANUELLE réclamée alors que ceph.sources était bien là
+        (d'où le log contradictoire : preflight « dépôt ceph-squid »
+        — la détection de branche pipe dans head -1, qui MASQUE le
+        code retour de grep — puis Phase A « aucun fichier
+        déclarant le dépôt trouvé »). D'où le « || true » : le code
+        retour est forcé à 0 et les correspondances sont conservées
+        — un chemin en erreur ne masque plus jamais les fichiers
+        trouvés de l'autre chemin."""
+        out = self._ssh(
+            node,
+            f"grep -rls 'ceph-{branch}' /etc/apt/sources.list.d/ "
+            f"/etc/apt/sources.list 2>/dev/null || true")
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
     def kernel_version(self, node: str) -> Tuple[int, int]:
         try:
             out = self._ssh(node, "uname -r")
@@ -1079,23 +1531,83 @@ class ProxmoxClient:
             return [f.get("name", "?") for f in out if isinstance(f, dict)]
         return []
 
+    def fs_dump_actives(self) -> Tuple[List[str], List[str], int]:
+        """Carte des MDS via « ceph fs dump -f json » (commande MON
+        native, fiable en MULTI-FS — le « mdsmap » global de « ceph
+        status » ne reflète qu'un seul FS et peut être vide/absent).
+        Retourne (noms des MDS ACTIVES, noms des standbys, nombre de
+        ranks up). Lecture pure, dry-run OK. Sortie RÉELLE (vécu
+        09:35) : le JSON est suivi d'une ligne vide puis « dumped
+        fsmap epoch N » — décodage via _json_lenient, PAS un
+        json.loads() intégral qui avorte le run à tort."""
+        out = self.ceph_run("ceph fs dump -f json")
+        data = self._json_lenient(out)
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Sortie non-JSON de « ceph fs dump » : "
+                               f"{out.strip()[:200]}")
+        actives: List[str] = []
+        standbys: List[str] = []
+        up_ranks = 0
+        for fs in data.get("filesystems") or []:
+            mdsmap = fs.get("mdsmap") or fs
+            info = mdsmap.get("info") or {}
+            for _rank, gid in (mdsmap.get("up") or {}).items():
+                up_ranks += 1
+                ent = info.get(str(gid)) or {}
+                name = str(ent.get("name", "")).replace("mds.", "")
+                if name and name not in actives:
+                    actives.append(name)
+        for ent in data.get("standbys") or []:
+            name = str(ent.get("name", "")).replace("mds.", "")
+            if name and name not in standbys:
+                standbys.append(name)
+        return actives, standbys, up_ranks
+
     # ---------- Gates de stabilisation ----------
     def wait_ceph_stable(self, action: str,
                          node: Optional[str] = None,
                          timeout: Optional[int] = None,
-                         require_clean: bool = True) -> bool:
+                         require_clean: bool = False) -> bool:
         """LA gate centrale : attend que le cluster soit de nouveau
-        opérationnel après un redémarrage de daemon :
+        OPÉRATIONNEL après un redémarrage de daemon :
           1. santé effective HEALTH_OK (AUTH_INSECURE_* tolérés si
              PVE_CEPH_ALLOW_AUTH_INSECURE=1 — toute autre dégradation
              compte) ;
           2. quorum mon COMPLET ;
-          3. PGs : nombre de PGs non « active+clean » ≤
-             PVE_CEPH_MAX_DEGRADED_PGS (défaut 0) ;
+          3. PGs ACTIVES : aucune PG en peering/down/incomplete… —
+             une PG non active ne sert PAS ses données, on bloque ;
           4. si `node` est fourni : tous les OSDs de ce nœud sont 'up'.
-        `require_clean=False` : phase volontairement dégradée (OSD
-        arrêté pour rotation de clé) — seul le retour 'up' du nœud est
-        attendu. Retourne False si timeout atteint."""
+        « clean » N'est PAS exigé pendant la fenêtre de maintenance
+        (`require_clean=False`, le défaut des gates du run) : nos
+        propres flags nobackfill/norebalance/norecover GÈLENT le
+        backfill — une PG « active+remapped » (ex. vécu : retour
+        d'osd.0 après son restart, la PG doit backfiller POUR
+        RETOURNER sur osd.0) reste non clean PENDANT TOUTE la
+        fenêtre, et l'exiger causait une attente infinie alors que
+        santé, quorum, PGs actives et OSDs up étaient tous OK. La
+        convergence complète (active+clean) est vérifiée par la
+        CONVERGENCE FINALE, APRÈS le retrait des flags
+        (CephUpdater._final_converge) — le seul endroit où le
+        recovery n'est plus gelé par le run lui-même.
+        `require_clean=True` : exige en plus 0 PG non clean
+        (convergence finale uniquement). Retourne False si timeout
+        atteint (le message de timeout NOMME ce qui bloque : états
+        PGs bloquantes, OSDs jamais revenues 'up').
+
+        PENDANT la fenêtre de maintenance (flags posés via
+        ceph_set_maintenance_window) les checks PG gelés par le
+        recovery/backfill/scrub (CEPH_PG_FROZEN_CHECKS — PG
+        dégradée/undersized, scrubs en retard) sont attendus et ne
+        comptent PAS dans la santé effective : ils ne peuvent PAS se
+        résorber avant le retrait des flags (vécu : osd.16, PG
+        « stuck peering » de longue date ressortie dégradée — 14 min
+        de polls « 0 PG non active », gate condamnée au timeout alors
+        que santé réelle, quorum, PGs actives et OSDs up étaient OK).
+        Le diagnostic est interrogé à CHAQUE poll : un état IDENTIQUE
+        n'est pas redumpé (déduplication par signature), mais un
+        CHANGEMENT de dégradations réapparaît — et le message de
+        convergence NOMME les checks qui bloquent encore, pour ne
+        plus jamais attendre « pour rien » sans savoir pourquoi."""
         t0 = time.time()
         timeout = timeout or CEPH_STABLE_TIMEOUT
         osd_ids: List[int] = []
@@ -1105,62 +1617,128 @@ class ProxmoxClient:
                 osd_ids = tree.get(node, [])
             except Exception:
                 osd_ids = []
-        diag_done = False
         last_pgs = ""
         while True:
             st = self.ceph_status()
             if st is None:
                 raise RuntimeError("Ceph devenu injoignable — abort.")
-            health, ignored = self.ceph_effective_health(st)
+            status, ignored, skipped, blocking_checks = self._health_parts(st)
+            if not skipped:
+                health = status
+            else:
+                sevs = [str((c or {}).get("severity", ""))
+                        for c in blocking_checks.values()]
+                if any("ERR" in sev for sev in sevs):
+                    health = "HEALTH_ERR"
+                elif any("WARN" in sev for sev in sevs):
+                    health = "HEALTH_WARN"
+                else:
+                    health = "HEALTH_OK"
             if ignored:
                 self.ceph_log_auth_insecure(ignored)
+            frozen = sorted(c for c in skipped
+                            if c in CEPH_PG_FROZEN_CHECKS)
             quorum_ok = self.mon_quorum_complete(st)
-            pg_bad = -1
-            pg_desc = ""
+            # --- PGs : distinguer « non ACTIVE » (bloquant : pas d'IO)
+            # de « non CLEAN » (mouvement de données DIFFÉRÉ par les
+            # flags de maintenance — non bloquant pendant la fenêtre) ;
+            # pgs_by_state agrège : [{"state_name": "active+clean",
+            # "count": N}, {"state_name": "active+remapped", …}, …].
             pgmap = st.get("pgmap") or {}
             states = pgmap.get("pgs_by_state") or []
+            non_active = sum(int(s.get("count", 0)) for s in states
+                             if "active" not in str(s.get("state_name",
+                                                          "")))
+            non_clean = sum(int(s.get("count", 0)) for s in states
+                            if "active" in str(s.get("state_name", ""))
+                            and "clean" not in str(s.get("state_name",
+                                                         "")))
+            blocking = non_active + (non_clean if require_clean else 0)
+            deferred = 0 if require_clean else non_clean
             if require_clean:
-                total = sum(int(s.get("count", 0)) for s in states) or 1
-                bad = total - sum(int(s.get("count", 0)) for s in states
-                                  if s.get("state_name") == "active+clean")
-                pg_bad = bad
-                bad_desc = ", ".join(f"{s.get('count')}×{s.get('state_name')}"
-                                     for s in states
-                                     if s.get("state_name") != "active+clean")
-                pg_desc = f"{bad} PG(s) non active+clean"
-                last_pgs = bad_desc
+                pg_desc = f"{blocking} PG(s) non active+clean"
+            else:
+                pg_desc = f"{non_active} PG(s) non active"
+                if deferred:
+                    pg_desc += (f" (+{deferred} non clean — recovery "
+                                f"gélé par les flags)")
+            last_pgs = ", ".join(
+                f"{s.get('count')}×{s.get('state_name')}" for s in states
+                if ("active" not in str(s.get("state_name", "")))
+                or (require_clean
+                    and str(s.get("state_name")) != "active+clean"))
             osd_ok = True
+            osd_down: List[str] = []
             if node and osd_ids:
                 try:
                     ups = self.osd_up_status()
-                    osd_ok = all(ups.get(i, {}).get("up") for i in osd_ids)
+                    osd_down = [f"{node}/osd.{i}" for i in osd_ids
+                                if not ups.get(i, {}).get("up")]
+                    osd_ok = not osd_down
                 except Exception:
                     osd_ok = False
             if (health == "HEALTH_OK" and quorum_ok
-                    and (pg_bad == 0 if require_clean else True)
-                    and osd_ok):
+                    and blocking == 0 and osd_ok):
+                frozen_txt = ""
+                if frozen:
+                    frozen_txt = (f" [hors {', '.join(frozen)} gelé(s) "
+                                  f"par les flags — vérifié(s) à la "
+                                  f"convergence finale]")
+                if "OSD_UPGRADE_FINISHED" in skipped:
+                    frozen_txt += (" [hors OSD_UPGRADE_FINISHED — "
+                                   "attendu : toutes les OSDs sont "
+                                   "déjà en cible, « require-osd-"
+                                   "release » sera posé par ce run "
+                                   "après la phase MDS et la "
+                                   "convergence finale re-vérifiera]")
                 self.log.info(f"Ceph stable après « {action} » "
-                              f"(HEALTH_OK, quorum complet, PGs actives "
-                              f"+ propres ✔"
-                              + (f", OSDs de {node} 'up' ✔" if node and osd_ids
-                                 else "") + ")")
+                              f"(HEALTH_OK, quorum complet, "
+                              + ("PGs actives + propres ✔"
+                                 if require_clean else "PGs actives ✔")
+                              + (f" [{deferred} non clean — recovery "
+                                 f"gelé par les flags, convergence "
+                                 f"prévue après leur retrait]"
+                                 if deferred else "")
+                              + frozen_txt
+                              + (f", OSDs de {node} 'up' ✔" if node
+                                 and osd_ids else "") + ")")
                 return True
             if time.time() - t0 > timeout:
-                self.ceph_diagnose(st)
+                self.ceph_diagnose(st, force=True)
                 if last_pgs:
-                    self.log.error(f"PGs non nettoyées : {last_pgs}")
+                    self.log.error(f"PGs non stabilisées : {last_pgs}")
+                if osd_down:
+                    self.log.error("OSDs jamais revenues 'up' : "
+                                   + ", ".join(osd_down))
                 self.log.error(f"Ceph non stabilisé après {timeout}s "
                                f"(action « {action} »).")
                 return False
-            if not diag_done and health not in ("HEALTH_OK",):
+            if health != "HEALTH_OK":
+                # Dédupliqué par ceph_diagnose : n'apparaît qu'au
+                # CHANGEMENT de dégradations — plus jamais de dump
+                # identique répété, mais plus jamais de silence non
+                # expliqué non plus.
                 self.ceph_diagnose(st)
-                diag_done = True
+            wait_txt = ""
+            if blocking_checks:
+                codes = "/".join(sorted(blocking_checks)[:4])
+                if len(blocking_checks) > 4:
+                    codes += "…"
+                wait_txt = f", check(s) en attente : {codes}"
+            osd_wait = ""
+            if node and osd_ids and not osd_ok:
+                osd_wait = (f", OSDs {node} en attente"
+                            + (f" ({', '.join(osd_down[:8])})"
+                               if osd_down
+                               else " (état illisible : « ceph osd "
+                                     "dump --format json »)"))
             self.log.warning(f"Ceph en convergence après « {action} » "
-                             f"(santé {health}, quorum "
+                             f"(santé {health}"
+                             + wait_txt
+                             + f", quorum "
                              f"{'OK' if quorum_ok else 'INCOMPLET'}"
-                             + (f", {pg_desc}" if require_clean else "")
-                             + (f", OSDs {node} en attente" if node and osd_ids
-                                and not osd_ok else "")
+                             + (f", {pg_desc}" if pg_desc else "")
+                             + osd_wait
                              + f") — recheck toutes les {CEPH_POLL_S}s…")
             time.sleep(CEPH_POLL_S)
 
@@ -1184,6 +1762,15 @@ class CephUpdater:
         self.client = client
         self.action = args["action"]
         self.major_release = args.get("major")
+        # Release CIBLE du run, exposée au client pour la tolérance
+        # OSD_UPGRADE_FINISHED (cf. ProxmoxClient._osd_upgrade
+        # _finished_expected) : les gates de la Phase E voient ce
+        # check dès la dernière OSD redémarrée en cible, alors que
+        # require-osd-release n'est posé qu'en Phase G (après les
+        # MDS) — l'exiger entre les deux attend une condition que
+        # ce run lui-même ne crée qu'à la fin.
+        self.client._osd_require_target = (
+            self.major_release or "") if self.action == "major" else ""
         self.only_node = args.get("node")
         # rotate-keys : clients métier dont la rotation est DIFFÉRÉE
         # (--skip-client, répétable). Normalisation : préfixe « client. »
@@ -1221,6 +1808,12 @@ class CephUpdater:
         # et nombre de tests réussis — récapitulés au bilan final.
         self._nonsharded: List[str] = []
         self._shard_probed: int = 0
+        # Phase E : mode par défaut (version-check + ceph-osd.target)
+        # ou opt-in --force-detection-sharding (OSDs une par une) —
+        # récapitulé au bilan final.
+        self._osd_skipped: int = 0
+        self._osd_target_used: bool = False
+        self.force_sharding = bool(args.get("force_sharding_detection"))
 
     # ---------------- Fichier d'état ----------------
     def _state_read(self) -> Dict:
@@ -1234,7 +1827,9 @@ class CephUpdater:
         if self.dry:
             return
         try:
-            os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+            d = os.path.dirname(STATE_FILE)
+            if d:
+                os.makedirs(d, exist_ok=True)
             with open(STATE_FILE, "w", encoding="utf-8") as fh:
                 json.dump({
                     "action": self.action,
@@ -1267,12 +1862,20 @@ class CephUpdater:
         return self.client.ceph_run(cmd, node=node)
 
     def _gate(self, action: str, node: Optional[str] = None,
-              require_clean: bool = True) -> None:
-        """Gate de stabilisation entre deux unités redémarrées."""
+              require_clean: bool = False) -> None:
+        """Gate de stabilisation entre deux unités redémarrées.
+        Pendant la fenêtre de maintenance, nos flags gelent le
+        backfill/recovery : une PG « active+remapped » (donc non
+        clean) est NORMALE et ne doit PAS bloquer — la gate exige
+        santé effective OK + quorum complet + PGs ACTIVES + (si
+        `node`) OSDs du nœud 'up'. La convergence complète
+        (active+clean) est vérifiée par _final_converge APRÈS le
+        retrait des flags."""
         self.counts["gates"] += 1
         if self.dry:
             self.log.info(f"[SIMULATION] Gate santé après « {action} » : "
-                          f"HEALTH_OK + quorum complet + PGs active+clean "
+                          f"HEALTH_OK + quorum complet + PGs actives "
+                          f"(clean différé par les flags de maintenance) "
                           f"(hypothèse simulation)")
             self.est_s += EST_STABILIZE_S
             return
@@ -1339,9 +1942,12 @@ class CephUpdater:
             h = (st.get("health") or {})
             checks = h.get("checks") or {}
             non_ai = {c: v for c, v in checks.items()
-                      if not c.startswith("AUTH_INSECURE_")}
+                      if not c.startswith("AUTH_INSECURE_")
+                      and not (c == "OSDMAP_FLAGS"
+                               and self.client._osdmap_flags_all_maintenance(
+                                   v))}
             if non_ai:
-                self.client.ceph_diagnose(st)
+                self.client.ceph_diagnose(st, force=True)
                 raise RuntimeError(
                     "Le cluster présente des dégradations RÉELLES (hors "
                     "AUTH_INSECURE_*) — remédiation CVE refusée. Corrigez "
@@ -1355,10 +1961,65 @@ class CephUpdater:
         if ignored:
             self.client.ceph_log_auth_insecure(ignored)
         if health != "HEALTH_OK":
-            self.client.ceph_diagnose(st)
+            self.client.ceph_diagnose(st, force=True)
             raise RuntimeError(
                 f"Ceph est en {health} — action {self.action} REFUSÉE : "
                 f"un cluster dégradé ne se met pas à jour.")
+        # Checks PG gelés par des flags de maintenance DÉJÀ posés sur le
+        # cluster (hors de ce run — admin ou run précédemment interrompu
+        # brutalement) : tant que norecover/nobackfill gèlent le
+        # recovery, ces PG ne PEUVENT PAS guérir (ex. vécu :
+        # « active+recovery_wait+degraded »), et les exiger ici
+        # condamnait le preflight à refuser éternellement. Ils sont
+        # listés pour rester VISIBLES (ce ne sont pas des checks
+        # sains) : ils devront disparaître après le retrait des flags
+        # — la convergence finale les vérifie pour de vrai.
+        _st_h = (st.get("health") or {})
+        frozen_pre = sorted(
+            c for c in (self.client._health_parts(st)[2] or ())
+            if c in CEPH_PG_FROZEN_CHECKS)
+        if frozen_pre and not getattr(self.client, "_maint_window", False):
+            self.log.warning(
+                f"[Ceph] {len(frozen_pre)} check(s) PG gelé(s) par des "
+                f"flags de maintenance DÉJÀ posés sur le cluster :")
+            for c in frozen_pre:
+                chk = (_st_h.get("checks") or {}).get(c) or {}
+                msg = str(((chk.get("summary") or {}).get("message"))
+                          or "").strip()
+                self.log.warning(f"    {c} : {msg}")
+                for d in (chk.get("detail") or [])[:3]:
+                    dm = ((d.get("message") or "").strip()
+                          .replace("\n", " "))
+                    if dm:
+                        self.log.warning(f"        {dm[:200]}")
+            self.log.warning(
+                "    → attendu(s) tant que les flags gèlent le "
+                "recovery ; à vérifier après leur retrait (convergence "
+                "finale). Si ces flags ne sont PAS de vous : « ceph osd "
+                "dump | grep flags » pour décider.")
+        # OSD_UPGRADE_FINISHED déjà présent au preflight (reprise d'un
+        # run majeur interrompu AVANT la phase require-osd-release, ou
+        # montée terminée à la main sans l'avoir relevé) : toutes les
+        # OSDs tournent déjà en cible mais require_osd_release est
+        # resté en retrait — toléré (ce run le posera après la phase
+        # MDS), listé pour rester VISIBLE, et la convergence finale
+        # re-vérifiera la santé réelle une fois le check disparu.
+        if (self.action == "major"
+                and "OSD_UPGRADE_FINISHED"
+                in (self.client._health_parts(st)[2] or ())):
+            _uchk = ((_st_h.get("checks") or {})
+                     .get("OSD_UPGRADE_FINISHED") or {})
+            _umsg = str(((_uchk.get("summary") or {})
+                         .get("message")) or "").strip()
+            self.log.warning(
+                f"[Ceph] Check OSD_UPGRADE_FINISHED déjà présent : "
+                f"{_umsg}")
+            self.log.warning(
+                f"    → attendu : toutes les OSDs tournent en "
+                f"{self.major_release} mais « require_osd_release » "
+                f"n'est pas encore relevé ; ce run le posera (après "
+                f"la phase MDS) et la convergence finale re-vérifiera "
+                f"la santé réelle.")
         # Utilisation globale : un upgrade raté sur un cluster presque
         # plein = recovery interminable.
         util = self.client.ceph_utilization_pct()
@@ -1600,24 +2261,27 @@ class CephUpdater:
                 f"« ceph osd df » (colonne META ; un Total Space en "
                 f"baisse dans l'UI PVE est un autre symptôme) ; "
                 f"contournement : « ceph daemon osd.N compact » un par "
-                f"un (I/O intensif, heures creuses). Le run réel "
-                f"testera le sharding de CHAQUE OSD automatiquement "
-                f"pendant la Phase E (arrêt → show-sharding → "
-                f"démarrage) — récapitulatif au bilan.")
+                f"un (I/O intensif, heures creuses). Vérité terrain : "
+                f"« --force-detection-sharding » teste le sharding "
+                f"réel de chaque OSD (arrêt → show-sharding → "
+                f"démarrage), sinon surveillez « ceph osd df » "
+                f"(colonne META) après la montée.")
         elif probed:
             self.log.info(
                 f"Aucune OSD antérieure à Pacific (v16) détectée (date "
                 f"de création des répertoires de {probed} OSD(s)) — le "
-                f"piège META du wiki ne s'applique pas.")
+                f"piège META du wiki ne s'applique PROBABLEMENT pas "
+                f"(heuristique indicative, non infaillible ; vérité "
+                f"terrain : --force-detection-sharding).")
         else:
             self.log.warning(
                 "Dates de création des OSDs illisibles — impossible "
                 "d'exclure le piège META du wiki (OSDs créées sous "
                 "Octopus v15 ou avant, RocksDB non shardé) : vérifiez "
                 "« ceph osd df » (colonne META) après la montée ; "
-                "contournement : « ceph daemon osd.N compact ». Le run "
-                "réel testera le sharding de chaque OSD en Phase E — "
-                "récapitulatif au bilan.")
+                "contournement : « ceph daemon osd.N compact ». "
+                "Vérité terrain : « --force-detection-sharding » "
+                "teste le sharding réel de chaque OSD en Phase E.")
 
     def _rotate_keys_preflight(self, st: Dict) -> bool:
         """Gates propres à la remédiation CVE-2025-30156. Retourne False
@@ -1668,18 +2332,35 @@ class CephUpdater:
     # ---------------- Flags ----------------
     def _flags_on(self) -> None:
         banner(self.log, "Pose des flags de maintenance Ceph", ColorFormatter.GREEN)
+        # Fenêtre de maintenance OUVERTE : les checks PG gelés par le
+        # recovery/backfill/scrub deviennent « attendus » aux gates
+        # (cf. CEPH_PG_FROZEN_CHECKS) — ils ne peuvent pas se résorber
+        # avant le retrait des flags.
+        self.client.ceph_set_maintenance_window(True)
         if self.dry:
             flags = [f for f in CEPH_MAINT_FLAGS
                      if f not in (self.client.ceph_flags_current() or {})]
-            self.flags_we_set = {f: True for f in flags}
+            # MERGE : conserver les flags ADOPTÉS d'un run précédent
+            # (preflight) — un simple remplacement les perdait et le
+            # finally ne retirait alors que nos 2 flags, laissant
+            # les 4 adoptés orphelins (plus de fichier d'état →
+            # reclassés « admin » au run suivant, JAMAIS retirés).
+            self.flags_we_set.update({f: True for f in flags})
             self._sim(f"Pose des flags de maintenance : "
                       f"{', '.join(sorted(flags))} (les flags déjà posés "
                       f"par l'admin sont conservés)")
             return
-        self.flags_we_set = self.client.ceph_maintenance_on()
+        # MERGE, même raison : flags adoptés + flags nouvellement posés.
+        changed = self.client.ceph_maintenance_on(
+            adopted=sorted(self.flags_we_set))
+        self.flags_we_set.update(changed)
         self._state_write("démarrage")
 
     def _flags_off(self) -> None:
+        # Fenêtre de maintenance FERMÉE (avant tout early-return) :
+        # un check PG dégradé/undersized redevient BLOQUANT — la
+        # convergence finale, qui suit, le vérifie pour de vrai.
+        self.client.ceph_set_maintenance_window(False)
         if not self.flags_we_set:
             return
         if self.dry:
@@ -1690,15 +2371,78 @@ class CephUpdater:
         self.client.ceph_maintenance_off(self.flags_we_set)
         self._state_clear()
 
+    def _final_converge(self) -> None:
+        """Dernière vérification, APRÈS le retrait des flags : le
+        backfill/recovery gelé pendant la fenêtre reprend, et les
+        PGs restées non clean (ex. « active+remapped » au retour
+        d'une OSD) doivent converger MAINTENANT — c'est ici, et
+        seulement ici, que « active+clean » est exigé. Des flags
+        posés hors de ce run (admin) gèlent encore le mouvement :
+        impossible d'exiger clean — le run les signale avec les
+        commandes de retrait exactes. Un timeout n'échoue PAS le
+        run : le cluster continue de converger tout seul."""
+        try:
+            remaining = sorted(
+                f for f in CEPH_MAINT_FLAGS
+                if f in (self.client.ceph_flags_current() or {}))
+        except Exception:
+            remaining = []
+        if remaining:
+            self.log.warning(
+                "Flags de maintenance toujours posés (hors de ce run) : "
+                f"{', '.join(remaining)} — recovery/backfill GELÉS "
+                "jusqu'à leur retrait : convergence complète différée. "
+                "Retrait manuel : "
+                + " ; ".join(f"ceph osd unset {f}" for f in remaining))
+            if not self.client.wait_ceph_stable(
+                    "convergence finale (flags restants)",
+                    require_clean=False):
+                self.log.warning("Santé/quorum/PGs actives pas encore "
+                                 "tous rétablis à la fin du run — "
+                                 "vérifiez « ceph -s ».")
+            return
+        self.log.info("Flags retirés — le recovery/backfill reprend : "
+                      "attente de la convergence finale (PGs "
+                      "active+clean)…")
+        if self.client.wait_ceph_stable(
+                "convergence finale (recovery + backfill)",
+                timeout=FINAL_CONVERGE_TIMEOUT,
+                require_clean=True):
+            self.log.info("Convergence finale ✔ (HEALTH_OK, quorum "
+                          "complet, PGs active+clean) — fenêtre de "
+                          "maintenance terminée.")
+        else:
+            self.log.warning(
+                f"Backfill/recovery pas encore terminé au bout de "
+                f"{FINAL_CONVERGE_TIMEOUT}s — le run a RÉUSSI ; le "
+                f"cluster continue de converger seul. Surveillez "
+                f"« ceph -s » jusqu'à « active+clean » (aucune action "
+                f"requise).")
+
     # ---------------- Action 1 : mise à jour MINEURE ----------------
     def minor_scan(self) -> Dict[str, List]:
         """Rafraîchit les listes apt de chaque nœud et collecte les
         paquets Ceph en attente (lecture seule — AVANT toute pose de
-        flag). Retourne {nœud: [(paquet, version), …]}."""
+        flag). Retourne {nœud: [(paquet, version), …]}.
+
+        « apt-get update -q » est SANS RISQUE (cache des paquets
+        uniquement) : il est exécuté RÉELLEMENT même en dry-run, pour
+        que la liste des paquets en attente soit authentique
+        (« apt-get -s full-upgrade » reste une simulation pure)."""
         pending_by_node: Dict[str, List] = {}
         for node in self.nodes:
             if self.dry:
-                self._sim(f"{node} : apt-get update -q")
+                try:
+                    self.client.apt_update(node)
+                    self.log.info(
+                        f"{node} : apt-get update -q exécuté "
+                        f"RÉELLEMENT (dry-run : sans risque — cache "
+                        f"des paquets uniquement)")
+                except Exception as e:
+                    self.log.warning(
+                        f"{node} : apt-get update -q impossible ({e}) — "
+                        f"la simulation apt qui suit peut sous-estimer "
+                        f"les paquets en attente.")
             else:
                 self.client.apt_update(node)
             pending_by_node[node] = self.client.ceph_pkg_pending(node)
@@ -1775,6 +2519,51 @@ class CephUpdater:
                               f"rien à redémarrer.")
 
     # ---------------- Action 2 : mise à jour MAJEURE ----------------
+    def _mon_release_check(self, rel: str, num: int) -> None:
+        """Vérifie « ceph mon dump | grep min_mon_release ». Les mons
+        mettent la monmap à jour vers la nouvelle release quand ils
+        ont TOUS rejoint en version nouvelle : le bump prend
+        quelques secondes après le dernier restart (vécu : check
+        immédiat → monmap encore à l'epoch précédente → abort à
+        tort). Poll jusqu'à ELECTION_TIMEOUT_S :
+        - des mons tournent encore l'ancienne version → abort
+          immédiat (un restart a réellement échoué) ;
+        - tous en nouvelle version → attente de la monmap, abort au
+          timeout seulement si elle ne se met pas à jour."""
+        want = f"min_mon_release {num} "
+        t0 = time.time()
+        while True:
+            out = self.client.ceph_run("ceph mon dump | grep "
+                                       "min_mon_release")
+            got = " ".join(out.split())
+            if want in got + " ":
+                self.log.info(f"min_mon_release OK : {got} ✔")
+                return
+            versions = self.client.ceph_versions()
+            mons = versions.get("mon") or {}
+            late = [f"{nb}× {ver}" for ver, nb in sorted(mons.items())
+                    if not re.match(rf"ceph version {num}\.", ver)]
+            if late:
+                raise RuntimeError(
+                    f"min_mon_release attendu {num} ({rel}) non atteint "
+                    f"({got}) et des mons tournent encore l'ancienne "
+                    f"version ({'; '.join(late)}) — un restart a échoué. "
+                    f"« ceph versions » / « ceph mon dump » pour "
+                    f"diagnostiquer, puis relancez (reprise).")
+            if time.time() - t0 > ELECTION_TIMEOUT_S:
+                raise RuntimeError(
+                    f"min_mon_release attendu {num} ({rel}) toujours non "
+                    f"atteint après {int(ELECTION_TIMEOUT_S)} s ({got}) "
+                    f"alors que tous les mons tournent en {rel} — la "
+                    f"monmap ne se met pas à jour. « ceph mon dump » / "
+                    f"« ceph versions » pour diagnostiquer, puis "
+                    f"relancez (reprise).")
+            self.log.warning(
+                f"Tous les mons tournent en {rel} — attente de la mise "
+                f"à jour AUTOMATIQUE de la monmap (min_mon_release "
+                f"{num}, recheck toutes les {CEPH_POLL_S} s)…")
+            time.sleep(CEPH_POLL_S)
+
     def major_run(self) -> None:
         rel = self.major_release
         num = KNOWN_RELEASES[rel]
@@ -1793,11 +2582,32 @@ class CephUpdater:
                 self.log.info(f"{node} : dépôt déjà sur ceph-{rel} — "
                                f"rien à faire.")
                 continue
-            self._mut(f"sed -i 's/ceph-{branch}/ceph-{rel}/g' "
-                      f"/etc/apt/sources.list.d/ceph.list "
-                      f"/etc/apt/sources.list.d/ceph.sources 2>/dev/null",
-                      node=node, desc=f"bascule du dépôt ceph-{branch} → "
-                                      f"ceph-{rel}")
+            # fichiers RÉELS déclarant le dépôt : le nom n'est pas
+            # standardisé (ceph.list, ceph.sources, pveceph.list,
+            # sources.list…) et un sed sur des chemins codés en dur
+            # échoue avec le code 2 quand ils n'existent pas.
+            try:
+                files = self.client.ceph_repo_files(node, branch)
+            except Exception:
+                files = []
+            if not files:
+                msg = (f"{node} : aucun fichier déclarant le dépôt "
+                       f"ceph-{branch} trouvé (ni /etc/apt/sources.list.d/ "
+                       f"ni /etc/apt/sources.list) — bascule à faire "
+                       f"MANUELLEMENT, puis relancez (reprise là où "
+                       f"le run s'est arrêté).")
+                if self.dry:
+                    self.log.warning(msg + " (simulation : le run "
+                                     "continuerait, l'exécution réelle "
+                                     "s'arrêterait ici.)")
+                    continue
+                raise RuntimeError(msg)
+            for path in files:
+                self._mut(f"sed -i 's/ceph-{branch}/ceph-{rel}/g' "
+                          f"\"{path}\"",
+                          node=node,
+                          desc=f"bascule du dépôt ceph-{branch} → "
+                               f"ceph-{rel} ({path})")
             if not self.dry:
                 out = self.client._ssh(
                     node, "grep -rh 'ceph-' /etc/apt/sources.list.d/ "
@@ -1811,13 +2621,73 @@ class CephUpdater:
                          f"(tous les nœuds, AVANT tout redémarrage)")
         for node in self.nodes:
             if self.dry:
-                self._sim(f"{node} : apt-get update -q")
+                # « apt-get update -q » ne modifie que le CACHE des
+                # paquets disponibles (rien n'est installé ni
+                # supprimé) : SANS RISQUE — exécuté RÉELLEMENT en
+                # dry-run, suivi de « apt-get -s full-upgrade »
+                # (simulation pure, lecture seule) pour AFFICHER ce
+                # qu'il y aurait à faire (vécu 10:34 : un dry-run
+                # 100 % [SIMULATION] ne renseignait pas sur les
+                # paquets réellement en attente).
+                try:
+                    self.client.apt_update(node)
+                    self.log.info(
+                        f"{node} : apt-get update -q exécuté "
+                        f"RÉELLEMENT (dry-run : sans risque — cache "
+                        f"des paquets uniquement)")
+                except Exception as e:
+                    self.log.warning(
+                        f"{node} : apt-get update -q impossible ({e}) — "
+                        f"la simulation apt qui suit peut sous-estimer "
+                        f"les paquets en attente.")
+                others: List[str] = []
+                pend = self.client.ceph_pkg_pending(node, others=others)
+                if pend:
+                    self.log.info(
+                        f"{node} : « apt-get full-upgrade » mettrait à "
+                        f"jour {len(pend)} paquet(s) Ceph :")
+                    for name, pver in pend[:25]:
+                        self.log.info(f"    {name} → {pver}")
+                else:
+                    self.log.info(
+                        f"{node} : aucun paquet Ceph en attente — "
+                        f"« apt-get full-upgrade » n'aurait rien à "
+                        f"faire pour Ceph.")
+                if others:
+                    self.log.info(
+                        f"{node} : (et {len(others)} autre(s) paquet(s) "
+                        f"non-Ceph — full-upgrade est GLOBAL, il les "
+                        f"mettrait à jour aussi)")
                 self._sim(f"{node} : apt-get full-upgrade -y (binaires {rel} "
                           f"installés, les anciens daemons tournent encore)")
             else:
                 self.client.apt_update(node)
-                self.log.info(f"{node} : apt full-upgrade (binaires {rel}) — "
-                              f"streaming…")
+                # « apt-get update -q » a rafraîchi le cache : la
+                # simulation « apt-get -s full-upgrade » (lecture
+                # pure) dit s'il reste QUELQUE CHOSE à faire. Rien
+                # à faire → full-upgrade inutile (vécu 10:50 : 3
+                # « 0 upgraded, 0 newly installed » streamés pour
+                # rien). Simulation ILLISIBLE → full-upgrade quand
+                # même (échec sûr, comportement historique).
+                sim = self.client.apt_sim_all(node)
+                if sim is not None and not sim[0] and not sim[1]:
+                    self.log.info(
+                        f"{node} : aucun paquet en attente après "
+                        f"« apt-get update -q » (simulation « apt-get -s "
+                        f"full-upgrade » vide) — « apt-get full-upgrade » "
+                        f"n'est PAS lancé : rien à faire, les binaires "
+                        f"sont déjà en place.")
+                    continue
+                if sim is None:
+                    self.log.warning(
+                        f"{node} : simulation « apt-get -s full-upgrade » "
+                        f"illisible — « apt-get full-upgrade » lancé quand "
+                        f"même (échec sûr).")
+                else:
+                    self.log.info(f"{node} : apt full-upgrade "
+                                  f"({len(sim[0])} paquet(s) Ceph, "
+                                  f"{len(sim[1])} autre(s), en attente) — "
+                                  f"streaming…")
                 self.client.apt_upgrade(node)
             self.counts["pkg_nodes"] += 1
             self._est((EST_APT_MIN + EST_UPGRADE_MIN) * 60)
@@ -1828,6 +2698,25 @@ class CephUpdater:
         restarted_mon = False
         for node in self.nodes:
             for mid in self.client.node_daemons(node)["mon"]:
+                # Version COURANTE du processus (« ceph tell mon.X
+                # version », lecture pure — cf. tell_running_version) :
+                # un mon qui TOURNE déjà sur la release cible a déjà
+                # été redémarré après l'upgrade des paquets, le
+                # redémarrer de nouveau ne lui apporte rien (vécu
+                # 09:34 : reprises successives, 3 mons déjà en
+                # tentacle re-redémarrés à chaque run). Lecture
+                # illisible → restart (échec sûr, wiki).
+                ver, _r = self.client.tell_running_version("mon", mid)
+                if ver == num:
+                    self.log.info(f"{node} : mon {mid} tourne déjà en "
+                                  f"{rel} — rien à faire.")
+                    continue
+                if ver == 0:
+                    self.log.warning(
+                        f"{node} : version courante du mon {mid} "
+                        f"ILLISIBLE (« ceph tell » ET « ceph mon "
+                        f"metadata ») — redémarrage par sécurité "
+                        f"(échec sûr).")
                 self._mut(f"systemctl restart ceph-mon@{mid}", node=node,
                           desc=f"redémarrage du mon {mid}")
                 self.counts["restarts"] += 1
@@ -1840,20 +2729,31 @@ class CephUpdater:
                           f"min_mon_release » → attendu : "
                           f"min_mon_release {num} ({rel})")
             else:
-                out = self.client.ceph_run("ceph mon dump | grep "
-                                           "min_mon_release")
-                got = out.strip()
-                if f"min_mon_release {num} " not in got + " ":
-                    raise RuntimeError(
-                        f"min_mon_release attendu {num} ({rel}) non atteint "
-                        f"({got}) — un mon n'a pas redémarré sur les nouveaux "
-                        f"binaires. « ceph mon dump » pour diagnostiquer.")
-                self.log.info(f"min_mon_release OK : {got} ✔")
+                self._mon_release_check(rel, num)
         # ---- Phase D : mgrs ----
         banner(self.log, "PHASE D — Redémarrage des MGRS (tous les nœuds)")
         restarted_mgr = False
         for node in self.nodes:
             for mid in self.client.node_daemons(node)["mgr"]:
+                # Version COURANTE du processus (même logique que les
+                # mons en Phase C et les OSDs en Phase E) : un mgr
+                # qui tourne déjà sur la cible est SAUTÉ ; lecture
+                # illisible → restart (échec sûr, wiki).
+                ver, _r = self.client.tell_running_version("mgr", mid)
+                if ver == num:
+                    self.log.info(f"{node} : mgr {mid} tourne déjà en "
+                                  f"{rel} — rien à faire.")
+                    continue
+                if ver == 0:
+                    self.log.warning(
+                        f"{node} : version courante du mgr {mid} "
+                        f"ILLISIBLE (« ceph tell » ET « ceph mgr "
+                        f"metadata ») — redémarrage par sécurité "
+                        f"(échec sûr). NB : les mgrs standby "
+                        f"n'ignorent plus le tell depuis le repli "
+                        f"« ceph mgr metadata » (vécu 10:34 : 2 mgrs "
+                        f"déjà en cible annoncés à tort « à "
+                        f"redémarrer »).")
                 self._mut(f"systemctl restart ceph-mgr@{mid}", node=node,
                           desc=f"redémarrage du mgr {mid}")
                 self.counts["restarts"] += 1
@@ -1865,22 +2765,88 @@ class CephUpdater:
                 self._sim("vérification : un mgr actif est présent "
                           "(« ceph mgr dump » → active_name)")
             else:
-                dump = self.client.ceph_json("ceph mgr dump")
-                if not dump.get("active_name"):
-                    raise RuntimeError("Aucun mgr actif après les "
-                                        "redémarrages — « ceph mgr dump » "
-                                        "pour diagnostiquer.")
-                self.log.info(f"mgr actif : {dump['active_name']} ✔")
-        # ---- Phase E : OSDs une par une, nœud par nœud ----
-        banner(self.log, "PHASE E — Mise à jour des OSDs UNE PAR UNE "
-                         "(nœud par nœud ; arrêt → test du sharding réel "
-                         "→ démarrage sur les nouveaux binaires)")
+                t0 = time.time()
+                while True:
+                    dump = self.client.ceph_json("ceph mgr dump")
+                    active = dump.get("active_name")
+                    if active:
+                        self.log.info(f"mgr actif : {active} ✔")
+                        break
+                    # L'élection du mgr actif prend quelques secondes
+                    # après les restarts : un check immédiat lirait
+                    # « active_name » vide et avorterait à tort.
+                    if time.time() - t0 > ELECTION_TIMEOUT_S:
+                        raise RuntimeError(
+                            "Aucun mgr actif après les redémarrages "
+                            f"(attente {int(ELECTION_TIMEOUT_S)} s) — "
+                            "« ceph mgr dump » pour diagnostiquer.")
+                    self.log.warning("Attente de l'élection du mgr "
+                                     f"actif (recheck toutes les "
+                                     f"{CEPH_POLL_S} s)…")
+                    time.sleep(CEPH_POLL_S)
+        # ---- Phase E : OSDs, nœud par nœud ----
+        # PAR DÉFAUT : versions courantes des daemons OSD (« ceph osd
+        # metadata ») lues avant la passe — un nœud dont TOUTES les
+        # OSDs tournent déjà sur {rel} est SAUTÉ (un daemon qui TOURNE
+        # sur la release cible a nécessairement été redémarré APRÈS
+        # l'upgrade des paquets : c'est une preuve, pas une hypothèse ;
+        # vécu : reprise 16:45, 12 OSDs déjà en tentacle re-stopées
+        # une par une pour rien) ; sinon ses OSDs sont redémarrées
+        # d'un coup via ceph-osd.target (une gate par nœud). Le test
+        # du sharding RocksDB par OSD (arrêt individuel obligatoire)
+        # est l'OPT-IN --force-detection-sharding : OSDs une par
+        # une, SANS exemption de version — la date de création des
+        # répertoires n'est qu'une heuristique, la vérité terrain
+        # est ce test.
+        if self.force_sharding:
+            banner(self.log, "PHASE E — Mise à jour des OSDs UNE PAR UNE "
+                             "(--force-detection-sharding ; arrêt → test "
+                             "du sharding réel → démarrage)")
+        else:
+            banner(self.log, "PHASE E — Mise à jour des OSDs (nœud par "
+                             "nœud : versions courantes vérifiées, puis "
+                             "« systemctl restart ceph-osd.target » — "
+                             "une gate par nœud)")
+        osd_versions: Dict[int, Tuple[int, str]] = {}
+        if self.force_sharding:
+            if self.dry:
+                self._sim("chaque OSD est arrêtée une par une (test du "
+                          "sharding réel via « ceph-bluestore-tool "
+                          "show-sharding ») puis redémarrée — SANS "
+                          "exemption de version")
+        else:
+            osd_versions = self.client.osd_running_versions()
+            if osd_versions:
+                by_rel: Dict[str, int] = {}
+                for _oid, (maj, r) in osd_versions.items():
+                    lab = r or f"v{maj}"
+                    by_rel[lab] = by_rel.get(lab, 0) + 1
+                self.log.info(
+                    "Versions courantes des OSDs : "
+                    + ", ".join(f"{nb}× {lab}"
+                                for lab, nb in sorted(by_rel.items()))
+                    + f" — les nœuds dont toutes les OSDs sont déjà en "
+                      f"{rel} sont sautés.")
+            else:
+                self.log.warning(
+                    "Versions courantes des OSDs illisibles "
+                    "(« ceph osd metadata ») — les OSDs seraient toutes "
+                    "redémarrées (échec sûr).")
+            if self.dry:
+                self._sim(f"les nœuds dont TOUTES les OSDs sont déjà "
+                          f"en {rel} seraient sautés ; les autres : "
+                          f"« systemctl restart ceph-osd.target » "
+                          f"(une gate par nœud)")
         for node in self.nodes:
             ids = self._osd_tree.get(node)
             if ids is None:
                 ids = [int(o) for o in self.client.node_daemons(node)["osd"]
                        if str(o).lstrip("-").isdigit()]
             if not ids:
+                continue
+            if not self.force_sharding:
+                self._osd_upgrade_node_target(node, ids, num,
+                                               osd_versions)
                 continue
             try:
                 dirs = {oid: p for oid, (p, _ts)
@@ -1925,30 +2891,70 @@ class CephUpdater:
 
     def _osd_upgrade_one(self, node: str, oid: int, path: Optional[str],
                          per_node: int) -> None:
-        """Cycle d'UNE OSD en montée majeure : arrêt → lecture du
-        sharding RocksDB RÉEL pendant l'arrêt (piège META du wiki,
-        ceph-bluestore-tool show-sharding — lecture pure) → démarrage
-        sur les nouveaux binaires → gate. Équivalent, plus progressif,
-        du « systemctl restart ceph-osd.target » du wiki : une seule
-        OSD down à la fois, et la vérité terrain du sharding en prime."""
+        """Cycle d'UNE OSD (mode --force-detection-sharding) : arrêt →
+        lecture du sharding RocksDB RÉEL pendant l'arrêt (piège META
+        du wiki, ceph-bluestore-tool show-sharding — lecture pure) →
+        démarrage sur les nouveaux binaires → gate. Plus progressif
+        que le « systemctl restart ceph-osd.target » du mode par
+        défaut : une seule OSD down à la fois, et la vérité terrain
+        du sharding en prime — SANS exemption de version (chaque
+        OSD est testée, même déjà sur la release cible)."""
         try:
             self._mut(f"systemctl stop ceph-osd@{oid}", node=node,
-                      desc=f"arrêt de osd.{oid}")
+                      desc=f"arrêt de {node}/osd.{oid}")
         except Exception:
             # Arrêt incertain : démarrage de secours best-effort, puis
             # abort propre (gate jamais passée → finally retire les flags).
             try:
                 self._mut(f"systemctl start ceph-osd@{oid}", node=node,
-                          desc=f"démarrage de secours de osd.{oid}")
+                          desc=f"démarrage de secours de {node}/osd.{oid}")
             except Exception:
                 pass
             raise
         self._shard_probe(node, oid, path)
         self._mut(f"systemctl start ceph-osd@{oid}", node=node,
-                  desc=f"démarrage de osd.{oid} sur les nouveaux binaires")
+                  desc=f"démarrage de {node}/osd.{oid} sur les nouveaux "
+                       f"binaires")
         self.counts["restarts"] += 1
         self._est(EST_RESTART_OSD_S / max(1, per_node))
-        self._gate(f"restart osd.{oid} ({node})", node=node)
+        self._gate(f"restart {node}/osd.{oid}", node=node)
+
+    def _osd_upgrade_node_target(self, node: str, ids: List[int],
+                                  num: int,
+                                  osd_versions: Dict[int, Tuple[int, str]]
+                                  ) -> None:
+        """Phase E PAR DÉFAUT : versions courantes des OSDs du nœud
+        (« ceph osd metadata »), puis « systemctl restart
+        ceph-osd.target » si (et seulement si) au moins une OSD
+        n'est PAS encore sur la release cible — un nœud déjà à jour
+        est sauté (reprise idempotente). Impact plus large : pendant
+        le restart, AUCUNE OSD du nœud ne sert d'IO — les réplicas
+        des autres nœuds maintiennent le service (min_size ≥ 2, ou
+        min_size_inactive/erasure selon le pool, requis). Le test du
+        sharding RocksDB par OSD y est IMPOSSIBLE (il exige l'arrêt
+        individuel de chaque OSD) : la vérité terrain est l'OPT-IN
+        --force-detection-sharding ; la date de création des
+        répertoires (préflight) n'est qu'une heuristique."""
+        stale = [int(o) for o in ids
+                 if osd_versions.get(int(o), (0, ""))[0] != num]
+        if not stale:
+            self._osd_skipped += len(ids)
+            self.log.info(f"{node} : toutes les OSDs tournent déjà en "
+                          f"{self.major_release} — rien à faire.")
+            return
+        self.log.info(
+            f"{node} : {len(stale)} OSD(s) à redémarrer ("
+            + ", ".join(f"osd.{o}" for o in sorted(stale))
+            + ") — redémarrage de TOUTES les OSDs du nœud via "
+            f"ceph-osd.target (une seule gate pour le nœud) ; sharding "
+            f"RocksDB NON testé dans ce mode (vérité terrain : "
+            f"--force-detection-sharding).")
+        self._mut("systemctl restart ceph-osd.target", node=node,
+                  desc=f"redémarrage de toutes les OSDs de {node}")
+        self.counts["restarts"] += len(ids)
+        self._est(EST_RESTART_OSD_S)
+        self._gate(f"restart ceph-osd.target ({node})", node=node)
+        self._osd_target_used = True
 
     def _shard_probe(self, node: str, oid: int,
                      path: Optional[str]) -> None:
@@ -1959,14 +2965,14 @@ class CephUpdater:
         p(3,0-12) …). Lecture pure : un échec quelconque (outil
         absent, chemin introuvable, sortie illisible) ne bloque
         JAMAIS la montée — l'OSD redémarre toujours."""
-        label = path or f"<répertoire de osd.{oid}>"
+        label = path or f"<répertoire de {node}/osd.{oid}>"
         if self.dry:
-            self._sim(f"test du sharding réel de osd.{oid} pendant "
+            self._sim(f"test du sharding réel de {node}/osd.{oid} pendant "
                       f"l'arrêt : « ceph-bluestore-tool show-sharding "
                       f"--path {label} » (lecture pure)")
             return
         if not path:
-            self.log.info(f"osd.{oid} : répertoire de données "
+            self.log.info(f"{node}/osd.{oid} : répertoire de données "
                           f"introuvable — test du sharding sauté "
                           f"(pas bloquant).")
             return
@@ -1975,25 +2981,29 @@ class CephUpdater:
                 f"ceph-bluestore-tool show-sharding --path {path}",
                 node=node)
         except Exception as exc:
-            self.log.warning(f"osd.{oid} : test du sharding impossible "
+            self.log.warning(f"{node}/osd.{oid} : test du sharding impossible "
                              f"({exc}) — pas bloquant.")
             return
         txt = (out or "").strip()
         self._shard_probed += 1
         if "failed to retrieve sharding def" in txt.lower():
-            self._nonsharded.append(f"osd.{oid} ({node})")
+            self._nonsharded.append(f"{node}/osd.{oid}")
             self.log.warning(
-                f"osd.{oid} : RocksDB NON shardé (show-sharding) — "
+                f"{node}/osd.{oid} : RocksDB NON shardé (show-sharding) — "
                 f"usage META à surveiller après la montée "
                 f"(récapitulatif au bilan).")
         elif txt:
-            self.log.info(f"osd.{oid} : RocksDB shardé ✔ (show-sharding)")
+            self.log.info(f"{node}/osd.{oid} : RocksDB shardé ✔ "
+                          f"(show-sharding)")
 
     def _major_mds(self) -> None:
         """Procédure MDS du wiki Proxmox : standby_replay off, max_mds→1,
-        attente des ranks, arrêt des standbys, restart du dernier actif,
-        redémarrage des standbys, restauration des réglages."""
+        attente des ranks, arrêt des standbys (unité par unité), restart
+        des actives EN DERNIER (une par FS, identifiées via « ceph fs
+        dump » — fiable en multi-FS, contrairement au mdsmap global de
+        « ceph status »), retour des standbys, restauration."""
         rel = self.major_release
+        num = KNOWN_RELEASES[rel]
         fs_list = self.client.fs_list()
         mds_nodes = [n for n in self.nodes
                      if self.client.node_daemons(n)["mds"]]
@@ -2029,61 +3039,128 @@ class CephUpdater:
                 self._mut(f"ceph fs set {fs} max_mds 1",
                           desc=f"{fs} : max_mds 1 (temporaire, "
                                f"origine {max_mds})")
-        # 2) attente de la réduction des ranks (lecture pure / sim)
+        # 2) attente de la réduction des ranks + 3) identification
+        #    des MDS ACTIVES par nom — tout via « ceph fs dump -f
+        #    json » (commande MON native, fiable en MULTI-FS ; le
+        #    mdsmap global de « ceph status » ne reflète qu'un seul
+        #    FS et peut être vide). Lecture pure, aussi en dry-run
+        #    pour une simulation fidèle : l'active est la DERNIÈRE à
+        #    redémarrer (wiki). En exécution, un échec de lecture
+        #    ABORT : refus d'arrêter des MDS sans savoir lesquelles
+        #    sont actives.
+        active_names: List[str] = []
         if self.dry:
             self._sim("attente : les ranks non nuls se désactivent "
-                      "(« ceph status » → active mds == nombre de FS)")
+                      "(« ceph fs dump » → 1 rank actif par FS)")
+            try:
+                active_names, _stb, _up = self.client.fs_dump_actives()
+            except Exception as exc:
+                self.log.warning(f"MDS actives illisibles ({exc}) — "
+                                 f"simulation générique.")
         else:
             t0 = time.time()
             while True:
-                st = self.client.ceph_status() or {}
-                mdsmap = st.get("mdsmap") or {}
-                active = mdsmap.get("up") or []
-                if len(active) <= len(fs_list):
-                    self.log.info(f"Ranks réduits : {len(active)} MDS "
-                                  f"actif(s) ✔")
+                try:
+                    active_names, _stb, up_ranks = \
+                        self.client.fs_dump_actives()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"MDS actives illisibles (« ceph fs dump » : "
+                        f"{exc}) — refus d'arrêter les MDS à l'aveugle : "
+                        f"la procédure wiki exige de redémarrer l'active "
+                        f"EN DERNIER. Diagnostiquez puis relancez "
+                        f"(reprise).") from exc
+                if up_ranks <= len(fs_list):
+                    self.log.info(f"Ranks réduits : {up_ranks} MDS "
+                                  f"active(s) au total (1 par FS) ✔")
                     break
                 if time.time() - t0 > CEPH_STABLE_TIMEOUT:
                     raise RuntimeError("Les ranks MDS ne se désactivent "
-                                       "pas — « ceph status » pour "
+                                       "pas — « ceph fs dump » pour "
                                        "diagnostiquer.")
                 self.log.warning("Attente de la désactivation des ranks "
                                  "MDS supplémentaires…")
                 time.sleep(CEPH_POLL_S)
-        # 3) nœud du/des MDS actifs (rank 0) — lecture pure, aussi en
-        # dry-run pour une simulation fidèle : l'actif est le DERNIER
-        # à redémarrer (wiki).
-        active_nodes: List[str] = []
-        st = self.client.ceph_status() or {}
-        for u in (st.get("mdsmap") or {}).get("up") or []:
-            name = str(u.get("name", "")).replace("mds.", "")
-            if name and name not in active_nodes:
-                active_nodes.append(name)
-        # 4) arrêt des standbys, restart de l'actif, retour des standbys
-        standby_nodes = [n for n in mds_nodes if n not in active_nodes]
-        for node in standby_nodes:
-            self._mut("systemctl stop ceph-mds.target", node=node,
-                      desc="arrêt du/de la MDS standby")
+        daemon_node: Dict[str, str] = {}
+        for node in mds_nodes:
+            for d in self.client.node_daemons(node)["mds"]:
+                daemon_node[str(d)] = node
+        missing = [a for a in active_names if a not in daemon_node]
+        if missing:
+            if self.dry:
+                self.log.warning(
+                    f"MDS active(s) hors inventaire : {', '.join(missing)}"
+                    f" — hypothèse simulation (restart générique).")
+            else:
+                raise RuntimeError(
+                    f"MDS active(s) hors inventaire des daemons : "
+                    f"{', '.join(missing)} — unités systemd introuvables, "
+                    f"refus d'arrêter les MDS à l'aveugle.")
+        # 4) arrêt des STANDBYS unité par unité (jamais le target : son
+        #    stop atteindrait AUSSI les MDS actives du nœud, et son
+        #    start ne relance que les unités « enabled » — asymétrie),
+        #    restart des actives EN DERNIER, retour des standbys.
+        standby_daemons = [(d, daemon_node[d]) for d in sorted(daemon_node)
+                           if d not in active_names]
+        mds_skipped: Set[str] = set()
+        for name, node in standby_daemons:
+            # Idempotence de reprise (même logique que mons/mgrs/OSDs) :
+            # une standby qui TOURNE déjà sur la cible n'a plus rien
+            # à gagner d'un cycle stop/start (vécu : run interrompu
+            # APRÈS le retour des standbys, redémarrées pour rien).
+            # Lecture illisible (daemon down) → stop/start quand même
+            # (échec sûr : le start la ramène).
+            ver, _r = self.client.tell_running_version("mds", name)
+            if ver == num:
+                self.log.info(f"MDS standby {name} ({node}) tourne déjà "
+                              f"en {rel} — rien à faire.")
+                mds_skipped.add(name)
+                continue
+            if ver == 0:
+                self.log.warning(
+                    f"version courante de la MDS standby {name} ({node}) "
+                    f"ILLISIBLE (« ceph tell » ET « ceph mds metadata ») "
+                    f"— stop/start quand même (échec sûr : le start la "
+                    f"ramène).")
+            self._mut(f"systemctl stop ceph-mds@{name}", node=node,
+                      desc=f"arrêt de la MDS standby {name} ({node})")
             self.counts["restarts"] += 1
             self._est(EST_RESTART_MDS_S)
-        for node in active_nodes:
-            self._mut("systemctl restart ceph-mds.target", node=node,
-                      desc="redémarrage du MDS actif (dernier à tourner "
-                           f"sur {rel})")
+        for name in active_names:
+            if name not in daemon_node:
+                continue    # signalé plus haut (dry uniquement)
+            node = daemon_node[name]
+            # Idem pour l'active : déjà sur la cible → skip (elle a
+            # déjà été redémarrée EN DERNIER par un run précédent).
+            ver, _r = self.client.tell_running_version("mds", name)
+            if ver == num:
+                self.log.info(f"MDS active {name} ({node}) tourne déjà "
+                              f"en {rel} — rien à faire.")
+                continue
+            if ver == 0:
+                self.log.warning(
+                    f"version courante de la MDS active {name} ({node}) "
+                    f"ILLISIBLE (« ceph tell » ET « ceph mds metadata ») "
+                    f"— restart quand même (échec sûr : elle repart sur "
+                    f"les nouveaux binaires).")
+            self._mut(f"systemctl restart ceph-mds@{name}", node=node,
+                      desc=f"redémarrage de la MDS active {name} — la "
+                           f"dernière à tourner sur {rel}")
             self.counts["restarts"] += 1
             self._est(EST_RESTART_MDS_S)
-            self._gate(f"restart MDS actif ({node})")
-        if self.dry and not active_nodes:
+            self._gate(f"restart MDS active {name} ({node})")
+        if self.dry and not active_names:
             # simulation fidèle même sans actif lisible : l'étape du
             # restart de l'actif (le DERNIER, wiki) doit apparaître.
             self._sim(f"redémarrage du MDS actif — le DERNIER à tourner "
-                      f"sur {rel} (nœud déterminé au run réel via "
-                      f"« ceph status » → mdsmap.up)")
+                      f"sur {rel} (noms réels lus via « ceph fs dump »)")
             self.counts["restarts"] += 1
             self._est(EST_RESTART_MDS_S)
-        for node in standby_nodes:
-            self._mut("systemctl start ceph-mds.target", node=node,
-                      desc="retour du/de la MDS standby")
+        for name, node in standby_daemons:
+            if name in mds_skipped:
+                continue    # jamais arrêtée : déjà en cible, rien à faire
+            self._mut(f"systemctl start ceph-mds@{name}", node=node,
+                      desc=f"retour de la MDS standby {name} ({node})")
         # 5) restauration des réglages d'origine
         for fs, (max_mds, asr) in orig.items():
             if max_mds > 1:
@@ -2234,7 +3311,8 @@ class CephUpdater:
             for oid in osds:
                 entity = f"osd.{oid}"
                 if not self._needs_key(entity):
-                    self.log.info(f"  {entity} : déjà en aes256k — repris ✔")
+                    self.log.info(f"  {node}/{entity} : déjà en aes256k — "
+                                  f"repris ✔")
                     continue
                 self._rotate_osd_key(node, oid, entity)
         self._state_write("clés osd rotationnées")
@@ -2283,11 +3361,24 @@ class CephUpdater:
         # --- Étape 12 : retrait définitif de « aes » ---
         banner(self.log, "ÉTAPE 12 — Retrait de « aes » des ciphers "
                          "autorisés (point de non-retour)")
-        inc = self._refresh_insecure()
-        leftover = [e for e in inc.get("AUTH_INSECURE_CLIENT_KEY_TYPE", [])
-                    if e and e != "client.admin"
-                    and e not in self.skip_clients]
-        leftover += inc.get("AUTH_INSECURE_SERVICE_KEY_TYPE", [])
+        # Même course asynchrone que _check_cleared (health check
+        # recalculé par les mons) : poller avant de REFUSER le retrait.
+        t0 = time.time()
+        while True:
+            inc = self._refresh_insecure()
+            leftover = [e for e in
+                        inc.get("AUTH_INSECURE_CLIENT_KEY_TYPE", [])
+                        if e and e != "client.admin"
+                        and e not in self.skip_clients]
+            leftover += inc.get("AUTH_INSECURE_SERVICE_KEY_TYPE", [])
+            if not leftover or time.time() - t0 > ROTATE_CHECK_TIMEOUT_S:
+                break
+            self.log.warning(
+                f"clés encore signalées en « aes » ({', '.join(leftover)})"
+                " — le health check des mons se recalcule toutes les "
+                f"quelques secondes, attente (recheck toutes les "
+                f"{CEPH_POLL_S} s, max {int(ROTATE_CHECK_TIMEOUT_S)} s)…")
+            time.sleep(CEPH_POLL_S)
         skipped_now = sorted(set(inc.get("AUTH_INSECURE_CLIENT_KEY_TYPE", []))
                              & self.skip_clients)
         if leftover:
@@ -2332,7 +3423,7 @@ class CephUpdater:
                     "AUTH_INSECURE_KEYS_ALLOWED"]
             self.log.info(f"Santé Ceph brute après rotation : {raw}")
             if raw != "HEALTH_OK" and sorted(ai) != sorted(expected):
-                self.client.ceph_diagnose(st)
+                self.client.ceph_diagnose(st, force=True)
                 raise RuntimeError(
                     f"Santé brute {raw} après la rotation — diagnostics "
                     f"ci-dessus. Les clés sont migrées ; corrigez le "
@@ -2412,9 +3503,9 @@ class CephUpdater:
         DU LABEL BLUESTORE (OSDs ceph-volume : la clé est dupliquée dans
         le label du disque) → start → gate (OSD 'up', PGs propres)."""
         self._mut(f"systemctl stop ceph-osd@{oid}", node=node,
-                  desc=f"arrêt de {entity}")
+                  desc=f"arrêt de {node}/{entity}")
         self._mut(f"ceph osd down {oid}",
-                  desc=f"{entity} marqué 'down' explicitement")
+                  desc=f"{node}/{entity} marqué 'down' explicitement")
         # device des OSDs ceph-volume (lecture pure) : LV lvm, sinon raw
         lv_path = self._osd_device_path(node, oid)
         chain = (f"ceph auth rotate --key-type=aes256k {entity} "
@@ -2427,17 +3518,17 @@ class CephUpdater:
                       f"/tmp/pru-rot.keyring")
         chain += " && rm -f /tmp/pru-rot.keyring"
         self._mut(chain, node=node,
-                  desc=f"rotation + import de la clé {entity}"
+                  desc=f"rotation + import de la clé {node}/{entity}"
                        + (f" + label bluestore ({lv_path})"
                           if lv_path else ""))
         if self.dry:
             self._sim_rotated.append(entity)
         self._mut(f"systemctl start ceph-osd@{oid}", node=node,
-                  desc=f"démarrage de {entity}")
+                  desc=f"démarrage de {node}/{entity}")
         self.counts["restarts"] += 1
         self.counts["keys_rotated"] += 1
         self._est(EST_KEY_ENTITY_S + EST_RESTART_OSD_S / 4)
-        self._gate(f"restart {entity} ({node})", node=node)
+        self._gate(f"restart {node}/{entity}", node=node)
 
     def _osd_device_path(self, node: str, oid: str) -> Optional[str]:
         """Chemin du device de DONNÉES d'un OSD ceph-volume (LV du « block »
@@ -2464,7 +3555,7 @@ class CephUpdater:
                 if e.get("lv_path"):
                     return str(e["lv_path"])
             if entries:
-                self.log.debug(f"    osd.{oid} : entrées ceph-volume lvm "
+                self.log.debug(f"    {node}/osd.{oid} : entrées ceph-volume lvm "
                                f"sans lv_path : {entries[0].get('lv_name')}")
         except Exception as e:
             err.append(f"lvm list : {e}")
@@ -2483,12 +3574,12 @@ class CephUpdater:
         # 3) Pas trouvé : distinguer « pas un OSD ceph-volume » (label
         #    sans objet) d'un échec de lecture (à vérifier manuellement).
         if err:
-            self.log.warning(f"  osd.{oid} : lecture ceph-volume impossible "
+            self.log.warning(f"  {node}/osd.{oid} : lecture ceph-volume impossible "
                              f"({' ; '.join(err)}) — device introuvable, "
                              f"label bluestore NON mis à jour : vérifiez "
                              f"manuellement si l'OSD refuse de redémarrer.")
         else:
-            self.log.info(f"  osd.{oid} : OSD non géré par ceph-volume — "
+            self.log.info(f"  {node}/osd.{oid} : OSD non géré par ceph-volume — "
                           f"pas de label bluestore à mettre à jour.")
         return None
 
@@ -2496,9 +3587,35 @@ class CephUpdater:
         """Rotation de client.admin avec clé de secours, distribution sur
         TOUS les chemins de keyring admin détectés, vérification sur
         chaque nœud, puis suppression de la clé de secours. Toutes les
-        opérations /tmp sont épinglées au MÊME nœud d'exécution."""
+        opérations /tmp sont épinglées au MÊME nœud d'exécution.
+
+        PIÈGE (vécu 11:40) : dès que « ceph auth rotate » remplace la clé
+        client.admin dans l'auth DB, l'ANCIENNE clé des keyrings LOCAUX
+        (/etc/ceph/…, /etc/pve/priv/ceph/… — répliqué pmxcfs, donc TOUS
+        les nœuds) est INVALIDÉE : « ceph auth get client.admin » avec
+        la CLI du nœud échoue en « [errno 13] RADOS permission denied
+        », et la CLI ceph de tout le cluster est hors service (le
+        retrait des flags du bloc finally aussi). C'est PRÉCISÉMENT
+        pour ça que la clé de secours client.admin-backup (mon
+        « allow * ») est créée AVANT : l'import de la nouvelle clé
+        passe par « ceph -n client.admin-backup -k …keyring auth get
+        client.admin », la CLI locale ne re-fonctionne qu'APRÈS son
+        import ; le keyring de secours est diffusé vers les nœuds qui
+        ne l'ont pas (il n'existe que sur le nœud d'exécution).
+
+        PIÈGE (vécu 12:29) : importer la nouvelle clé dans /etc/ceph et
+        les keyrings des storages ne suffit PAS — sur Proxmox VE la
+        CLI root lit le keyring AUTHORITATIF
+        /etc/pve/priv/ceph.client.admin.keyring (et ceph.mon.keyring
+        contient aussi une section client.admin). Tant qu'il garde
+        l'ancienne clé, « ceph -s » échoue en « monclient(hunting):
+        handle_auth_bad_method … (13) Permission denied » — d'où la
+        liste de chemins élargie de _admin_keyring_paths et la
+        vérification « ceph -s » sur CHAQUE nœud après les imports."""
         if not self._needs_key("client.admin"):
             self.log.info("client.admin déjà en aes256k — repris ✔")
+            self._admin_backup_cleanup()
+            self._admin_keyring_sync()
             return
         exec_node = self.nodes[0]
         # 1) clé de secours client.admin-backup (mon "allow *")
@@ -2510,12 +3627,21 @@ class CephUpdater:
                   "keyring auth ls >/dev/null",
                   node=exec_node,
                   desc="vérification de la clé de secours")
+        backup_content = ""
         if not self.dry:
-            out = self.client._ssh(exec_node,
-                                   "cat /tmp/pru-admin-backup.keyring")
-            self._backup_keyring(bdir, "client.admin-backup.keyring", out)
+            backup_content = self.client._ssh(
+                exec_node, "cat /tmp/pru-admin-backup.keyring")
+            self._backup_keyring(bdir, "client.admin-backup.keyring",
+                                 backup_content)
+            if not backup_content.strip():
+                raise RuntimeError(
+                    "keyring de secours client.admin-backup illisible — "
+                    "rotation de client.admin REFUSÉE (elle couperait la "
+                    "CLI ceph de tout le cluster sans clé de secours "
+                    "utilisable).")
         # 2) rotation (la NOUVELLE clé vit dans l'auth DB : chaque nœud la
-        #    récupère via « ceph auth get client.admin »)
+        #    récupère via « ceph -n client.admin-backup … auth get
+        #    client.admin » — la CLI locale ne marche PLUS ici)
         self._mut("ceph auth rotate --key-type=aes256k client.admin "
                   "> /tmp/pru-admin.keyring",
                   node=exec_node, desc="rotation de la clé client.admin")
@@ -2524,23 +3650,55 @@ class CephUpdater:
             self._backup_keyring(bdir, "client.admin.keyring", out)
         if self.dry:
             self._sim_rotated.append("client.admin")
-        # 3) import dans TOUS les keyrings admin de chaque nœud
+        # 3) import dans TOUS les keyrings admin de chaque nœud — VIA LA
+        #    CLÉ DE SECOURS (les keyrings locaux ne contiennent plus que
+        #    l'ancienne clé, invalidée par la rotation)
         for node in self.nodes:
+            if node != exec_node:
+                if self.dry:
+                    self._sim(f"diffusion du keyring de secours "
+                              f"client.admin-backup vers {node} (/tmp, "
+                              f"chmod 600, le temps de l'import)")
+                else:
+                    spread = ("printf '%s\\n' "
+                              + shlex.quote(backup_content)
+                              + " > /tmp/pru-admin-backup.keyring"
+                                " && chmod 600"
+                                " /tmp/pru-admin-backup.keyring")
+                    self._mut(spread, node=node,
+                              desc=f"diffusion du keyring de secours "
+                                   f"vers {node} (le temps de l'import)")
             paths = self._admin_keyring_paths(node)
             if not paths:
                 self.log.warning(f"  {node} : aucun keyring client.admin "
                                  f"détecté — vérification manuelle requise.")
                 continue
             for p in paths:
-                self._mut(f"ceph auth get client.admin > /tmp/pru-admin."
-                          f"keyring && ceph-authtool --import-keyring "
-                          f"/tmp/pru-admin.keyring {p} && rm -f "
-                          f"/tmp/pru-admin.keyring",
+                self._mut("ceph -n client.admin-backup"
+                          " -k /tmp/pru-admin-backup.keyring"
+                          " auth get client.admin > /tmp/pru-admin.keyring"
+                          " && ceph-authtool --import-keyring"
+                          " /tmp/pru-admin.keyring " + shlex.quote(p) +
+                          " && rm -f /tmp/pru-admin.keyring",
                           node=node,
-                          desc=f"import de la nouvelle clé admin dans {p}")
+                          desc=f"import de la nouvelle clé admin dans {p} "
+                               f"(via la clé de secours)")
             self._mut("ceph -s --format json >/dev/null", node=node,
                       desc=f"vérification : la CLI ceph de {node} "
                            f"fonctionne avec la nouvelle clé")
+            if node != exec_node:
+                if self.dry:
+                    self._sim(f"nettoyage du keyring de secours de {node}")
+                else:
+                    self._mut("rm -f /tmp/pru-admin-backup.keyring",
+                              node=node,
+                              desc=f"nettoyage du keyring de secours "
+                                   f"de {node}")
+        # 3bis) .secret des storages CephFS PVE en client.admin
+        #       IMPLICITE : la clé NUE — invisible pour la détection
+        #       keyring (aucune section [client.admin]) — doit être
+        #       régénérée AUSSI, sinon les storages restent KO
+        self._sync_cephfs_secrets()
         # 4) la clé de secours n'est plus utile (elle resterait une clé
         #    « aes » qui déclencherait AUTH_INSECURE_CLIENT_KEY_TYPE)
         self._mut("ceph auth rm client.admin-backup && rm -f "
@@ -2550,13 +3708,234 @@ class CephUpdater:
         self.counts["keys_rotated"] += 1
         self._est(EST_KEY_ENTITY_S * (1 + len(self.nodes)))
 
+    def _pve_cephfs_secrets(self) -> List[str]:
+        """Chemins .secret des storages PVE (cephfs/rbd) authentifiant
+        en client.admin IMPLICITE — sans ligne « username » dans
+        /etc/pve/storage.cfg, PVE utilise client.admin par défaut et
+        garde la clé de ce user dans /etc/pve/priv/ceph/<id>.secret
+        (clé NUE, PAS un keyring). Lecture pure."""
+        try:
+            cfg = self.client.ceph_run("cat /etc/pve/storage.cfg")
+        except Exception as e:
+            self.log.warning(f"/etc/pve/storage.cfg illisible ({e}) — "
+                             f"secrets CephFS des storages PVE non "
+                             f"vérifiés.")
+            return []
+        ids: List[str] = []
+        cur_type = cur_id = ""
+        has_user = False
+        for line in str(cfg or "").splitlines():
+            if line.strip() and not line[0].isspace():     # section
+                if cur_type in ("cephfs", "rbd") and not has_user \
+                        and cur_id:
+                    ids.append(cur_id)
+                head = line.strip()
+                cur_type = head.split(":", 1)[0] if ":" in head else ""
+                cur_id = head.split(":", 1)[1].strip() if ":" in head \
+                    else ""
+                has_user = False
+            elif line.strip():                              # propriété
+                kv = line.strip().split(None, 1)
+                if kv and kv[0] == "username":
+                    has_user = True
+        if cur_type in ("cephfs", "rbd") and not has_user and cur_id:
+            ids.append(cur_id)
+        if not ids:
+            return []
+        quoted = " ".join(shlex.quote(i) for i in ids)
+        try:
+            out = self.client.ceph_run(
+                "for s in " + quoted + "; do "
+                "[ -f /etc/pve/priv/ceph/$s.secret ] && echo $s; done")
+        except Exception:
+            return []
+        res = []
+        for ln in str(out or "").splitlines():
+            s = ln.strip()
+            if s:
+                res.append(f"/etc/pve/priv/ceph/{s}.secret")
+        return res
+
+    def _sync_cephfs_secrets(self, key_db: str = "") -> None:
+        """(Re)synchronise les .secret des storages PVE en client.admin
+        IMPLICITE (pas de « username » dans storage.cfg).
+
+        PIÈGE (vécu 13:1x) : un storage CephFS de Proxmox VE garde la
+        clé de son user dans /etc/pve/priv/ceph/<STORAGE_ID>.secret —
+        la clé NUE (PAS un keyring : aucune section [client.admin],
+        donc _admin_keyring_paths ne le voit JAMAIS). Sans username
+        explicite c'est une copie de la clé client.admin : « A CephFS
+        storage holds only the bare key » et « one created without an
+        explicit key holds a copy of client.admin, so rotating
+        client.admin alone cuts that storage off » (doc PVE) — après la
+        rotation de client.admin, les storages passent « non Active »
+        (montage KO) tant que le .secret n'est pas régénéré. Idempotent
+        : seuls les .secret divergents sont réécrits (« > » préserve
+        le mode du fichier existant)."""
+        paths = self._pve_cephfs_secrets()
+        if not paths:
+            return
+        if self.dry:
+            self._sim("vérification : les .secret des storages PVE en "
+                      "client.admin implicite (" + ", ".join(paths) +
+                      ") contiennent la clé courante")
+            return
+        bare = (key_db or "").strip()
+        if not bare:
+            try:
+                bare = self.client.ceph_run(
+                    "ceph auth get-key client.admin").strip()
+            except Exception as e:
+                self.log.warning(f"Clé client.admin illisible ({e}) — "
+                                 f"secrets CephFS des storages PVE non "
+                                 f"vérifiés.")
+                return
+        if not bare:
+            return
+        for p in paths:
+            try:
+                cur = self.client.ceph_run("cat " + shlex.quote(p)
+                                           ).strip()
+            except Exception:
+                cur = None   # illisible : resynchroniser par prudence
+            if cur == bare:
+                self.log.info(f"  {p} contient déjà la clé admin "
+                              f"courante ✔")
+                continue
+            self.log.warning(f"  {p} contient une clé admin PÉRIMÉE — "
+                             f"régénération (clé nue de client.admin).")
+            self._mut("ceph auth get-key client.admin > "
+                      + shlex.quote(p),
+                      desc=f"synchronisation du secret CephFS {p}")
+
+    def _admin_keyring_sync(self) -> None:
+        """Reprise de l'étape 10 : les keyrings LOCAUX contiennent-ils
+        la clé client.admin COURANTE de l'auth DB ?
+
+        PIÈGE (vécu 13:0x) : la reprise juge « client.admin déjà en
+        aes256k » SUR L'AUTH DB SEULE — elle ne sait RIEN des keyrings
+        locaux. Or un run interrompu à l'étape 10 (FATAL avant les
+        imports) + une réparation manuelle PARTIELLE laissent des
+        keyrings avec l'ANCIENNE clé : sur Proxmox VE, les storages
+        CephFS/RBD de /etc/pve/priv/ceph/<storage>.keyring authentifient
+        par ces fichiers — les montages CephFS passent KO / les storages
+        PVE restent « non Active », alors même que la CLI est réparée
+        (authoritatif à jour) et que le run se termine en santé OK.
+        Cette vérification compare la clé de CHAQUE keyring détecté à
+        celle de l'auth DB et ré-importe (idempotent) les divergents :
+        la reprise CONVERGE au lieu de considérer l'étape acquise."""
+        if self.dry:
+            self._sim("vérification : les keyrings locaux client.admin "
+                      "contiennent la clé courante de l'auth DB")
+            return
+        try:
+            db = self.client.ceph_run("ceph auth get client.admin")
+        except Exception as e:
+            self.log.warning(f"Lecture de la clé client.admin dans "
+                             f"l'auth DB impossible ({e}) — "
+                             f"synchronisation des keyrings locaux "
+                             f"ignorée, vérifiez manuellement.")
+            return
+        key_db = ""
+        for line in str(db or "").splitlines():
+            if "key = " in line:
+                key_db = line.split("key = ", 1)[1].strip()
+                break
+        if not key_db:
+            self.log.warning("Clé client.admin illisible dans la sortie "
+                             "« ceph auth get client.admin » — "
+                             "synchronisation des keyrings locaux "
+                             "ignorée.")
+            return
+        for node in self.nodes:
+            try:
+                paths = self._admin_keyring_paths(node)
+            except Exception as e:
+                self.log.warning(f"  {node} : keyrings admin illisibles "
+                                 f"({e}) — nœud ignoré.")
+                continue
+            for p in paths:
+                try:
+                    out = self.client._ssh(
+                        node, "grep -F -q " + shlex.quote(key_db) + " "
+                        + shlex.quote(p) + " && echo yes || echo no")
+                    has_key = out.strip().endswith("yes")
+                except Exception:
+                    has_key = False
+                if has_key:
+                    self.log.info(f"  {node} : {p} contient déjà la clé "
+                                  f"admin courante ✔")
+                    continue
+                self.log.warning(f"  {node} : {p} contient une clé admin "
+                                 f"PÉRIMÉE — ré-import de la clé courante "
+                                 f"(keyring jamais mis à jour par un run "
+                                 f"interrompu / une réparation partielle).")
+                self._mut("ceph auth get client.admin"
+                          " > /tmp/pru-admin.keyring"
+                          " && ceph-authtool --import-keyring"
+                          " /tmp/pru-admin.keyring " + shlex.quote(p) +
+                          " && rm -f /tmp/pru-admin.keyring",
+                          node=node,
+                          desc=f"synchronisation du keyring admin {p}")
+        # .secret des storages CephFS PVE en client.admin implicite :
+        # clé NUE, invisible pour _admin_keyring_paths (vécu 13:1x)
+        self._sync_cephfs_secrets(key_db)
+
+    def _admin_backup_cleanup(self) -> None:
+        """Reprise d'un run interrompu : la clé de secours
+        client.admin-backup (mon « allow * ») n'est supprimée qu'APRÈS
+        la vérification de la CLI sur tous les nœuds — un run interrompu
+        ENTRE les deux (vécu 11:40 : FATAL « permission denied » à
+        l'import sur le premier nœud) la laisse dans l'auth DB : une
+        backdoor admin « allow * ». Elle est supprimée ici si elle
+        subsiste (la reprise n'exécute PAS l'étape 10 puisque
+        client.admin est déjà migrée)."""
+        if self.dry:
+            self._sim("vérification : clé de secours client.admin-backup "
+                      "absente de l'auth DB (supprimée par le run "
+                      "précédent)")
+            return
+        try:
+            out = self.client.ceph_run("ceph auth get client.admin-backup")
+        except Exception as e:
+            self.log.warning(f"client.admin-backup introuvable dans "
+                             f"l'auth DB ({e}) — vérifiez manuellement "
+                             f"« ceph auth ls | grep admin-backup ».")
+            return
+        if "client.admin-backup" not in str(out or ""):
+            return  # get a réussi sans keyring : absente, rien à faire
+        self.log.warning("client.admin-backup (clé de secours « mon "
+                         "allow * » d'un run interrompu) encore présente "
+                         "dans l'auth DB — suppression (la rotation de "
+                         "client.admin est déjà vérifiée).")
+        self._mut("ceph auth rm client.admin-backup",
+                  desc="suppression de la clé de secours orpheline "
+                       "(run précédent interrompu)")
+        self._mut("rm -f /tmp/pru-admin-backup.keyring",
+                  node=self.nodes[0],
+                  desc="nettoyage du keyring de secours local résiduel")
+
     def _admin_keyring_paths(self, node: str) -> List[str]:
-        """Chemins des keyrings contenant client.admin sur un nœud
-        (PVE : /etc/pve/priv/ceph/<fsid>.keyring et/ou
-        /etc/ceph/ceph.client.admin.keyring). Lecture pure."""
+        """Chemins des keyrings contenant client.admin sur un nœud.
+        Lecture pure.
+
+        PIÈGE (vécu 12:29) : sur Proxmox VE, le keyring admin
+        AUTHORITATIF est /etc/pve/priv/ceph.client.admin.keyring (pas
+        la copie de /etc/ceph !) — c'est LUI que lit la CLI « ceph »
+        du root via le ceph.conf PVE. /etc/pve/priv/ceph.mon.keyring
+        contient aussi une section client.admin (aux côtés de mon.) :
+        l'import par entité de ceph-authtool remplace client.admin SANS
+        toucher à mon. (merge sûr, ne jamais écraser le fichier).
+        Importer la nouvelle clé uniquement dans /etc/ceph/… et les
+        keyrings des storages (/etc/pve/priv/ceph/<id>.keyring) ne
+        répare PAS la CLI : « ceph -s » continue d'échouer en
+        « monclient(hunting): handle_auth_bad_method … (13) Permission
+        denied » tant que l'authoritatif garde l'ancienne clé."""
         out = self.client._ssh(
             node,
             "for f in /etc/ceph/ceph.client.admin.keyring "
+            "/etc/pve/priv/ceph.client.admin.keyring "
+            "/etc/pve/priv/ceph.mon.keyring "
             "/etc/pve/priv/ceph/*.keyring; do "
             "[ -f \"$f\" ] && grep -l '^\\[client\\.admin\\]' \"$f\" "
             "2>/dev/null; done")
@@ -2568,7 +3947,18 @@ class CephUpdater:
         des nœuds) sont re-distribuées automatiquement ; les clients
         métier (ex. client.fs) sont sauvegardés avec instructions de
         distribution MANUELLE (le script ne peut pas connaître leurs
-        consommateurs)."""
+        consommateurs).
+
+        PIÈGE (vécu 12:52) : le keyring bootstrap-<type> local
+        (/var/lib/ceph/<type>/ceph.keyring) ne doit être mis à jour QUE
+        là où le répertoire /var/lib/ceph/<type>/ EXISTE — il est absent
+        des nœuds (voire de tout le cluster) quand le service n'y est
+        pas déployé (ex. rbd/rbd-mirror/rgw sur un cluster sans ces
+        services), et « ceph auth get > …/ceph.keyring » échoue alors
+        en « No such file or directory ». La rotation de la clé DANS
+        l'auth DB, elle, a réussi : la reprise ne refera ni l'une ni
+        l'autre, il faut donc SKIPPER proprement (motif client.crash)
+        au lieu de laisser le run FATALer."""
         inc = self._refresh_insecure()
         clients = [e for e in inc.get("AUTH_INSECURE_CLIENT_KEY_TYPE", [])
                    if e and e != "client.admin"]
@@ -2602,13 +3992,30 @@ class CephUpdater:
             self._est(EST_KEY_ENTITY_S)
             if bootstrap:
                 btype = cid[len("bootstrap-"):]
+                bdir_path = f"/var/lib/ceph/{btype}"
                 for node in self.nodes:
-                    self._mut(f"ceph auth get {ent} > /var/lib/ceph/"
-                              f"{btype}/ceph.keyring && chmod 600 "
-                              f"/var/lib/ceph/{btype}/ceph.keyring",
-                              node=node,
-                              desc=f"mise à jour du keyring bootstrap-{btype} "
-                                   f"de {node}")
+                    # le répertoire du service n'existe pas partout :
+                    # ne mettre à jour le keyring QUE là où il est
+                    # déployé (vécu 12:52 : FATAL « No such file or
+                    # directory » sur bootstrap-rbd, service absent).
+                    try:
+                        out = self.client._ssh(
+                            node, f"test -d {bdir_path} && echo yes "
+                                  f"|| echo no")
+                        has_dir = out.strip().endswith("yes")
+                    except Exception:
+                        has_dir = False
+                    if has_dir:
+                        self._mut(f"ceph auth get {ent} > {bdir_path}/"
+                                  f"ceph.keyring && chmod 600 "
+                                  f"{bdir_path}/ceph.keyring",
+                                  node=node,
+                                  desc=f"mise à jour du keyring "
+                                       f"bootstrap-{btype} de {node}")
+                    else:
+                        self.log.info(f"  {ent} : {bdir_path} absent de "
+                                      f"{node} — service non déployé, "
+                                      f"rien à y distribuer.")
             elif crash:
                 # client.crash n'est PAS un client métier : c'est la clé du
                 # daemon ceph-crash des nœuds (keyring
@@ -2647,13 +4054,36 @@ class CephUpdater:
         # l'étape 12 refusera le retrait de « aes » avec la marche à suivre.
 
     def _check_cleared(self, code: str, err: str) -> None:
-        """Vérifie qu'un check AUTH_INSECURE_* a disparu après l'étape."""
-        inc = self._refresh_insecure()
-        if code in inc:
-            ents = inc.get(code) or []
-            raise RuntimeError(
-                f"{code} TOUJOURS PRÉSENT après l'étape ({err})"
-                + (f" — entités : {', '.join(ents)}" if ents else ""))
+        """Vérifie qu'un check AUTH_INSECURE_* a disparu après l'étape.
+
+        Le health check est recalculé ASYNCHRONEMENT par les mons :
+        une lecture immédiate peut relire l'état d'AVANT la dernière
+        rotation/étape (vécu 11:02 : FATAL « mds.v-testprox03-C » 7 s
+        après SON restart — la DERNIÈRE des 31 rotations — alors que
+        le check avait disparu à la lecture suivante, une seconde
+        plus tard ; même classe de course que min_mon_release et
+        l'élection mgr, déjà pollées ailleurs). On POLL donc
+        jusqu'à ROTATE_CHECK_TIMEOUT_S avant de déclarer FATAL — le
+        message d'échec reste inchangé : run relançable, la reprise
+        sautera ce qui est déjà traité."""
+        t0 = time.time()
+        while True:
+            inc = self._refresh_insecure()
+            if code not in inc:
+                break
+            if time.time() - t0 > ROTATE_CHECK_TIMEOUT_S:
+                ents = inc.get(code) or []
+                raise RuntimeError(
+                    f"{code} TOUJOURS PRÉSENT après l'étape ({err})"
+                    + (f" — entités : {', '.join(ents)}" if ents else ""))
+            self.log.warning(
+                f"{code} encore présent"
+                + (f" ({', '.join(inc.get(code) or [])})"
+                   if inc.get(code) else "")
+                + " — le health check des mons se recalcule toutes les "
+                f"quelques secondes, attente (recheck toutes les "
+                f"{CEPH_POLL_S} s, max {int(ROTATE_CHECK_TIMEOUT_S)} s)…")
+            time.sleep(CEPH_POLL_S)
         self.log.info(f"{code} : disparu ✔")
 
     def rotate_keys_run(self) -> None:
@@ -2728,6 +4158,22 @@ class CephUpdater:
                 f"Sharding RocksDB : {self._shard_probed} OSD(s) "
                 f"testée(s) pendant la Phase E — toutes shardées ✔ "
                 f"(piège META du wiki non applicable).")
+        if self._osd_target_used:
+            self.log.info(
+                "Phase E (mode par défaut) : sharding RocksDB NON testé "
+                "(restart ceph-osd.target par nœud — le test exige "
+                "l'arrêt individuel de chaque OSD) ; les dates de "
+                "création des répertoires ne sont qu'une heuristique "
+                "— vérité terrain : relancez un run avec "
+                "--force-detection-sharding (les OSDs déjà à jour "
+                "seront re-testées une par une), ou surveillez "
+                "« ceph osd df » (colonne META) après la montée.")
+        if self._osd_skipped:
+            self.log.info(
+                f"Reprise : {self._osd_skipped} OSD(s) déjà en "
+                f"{self.major_release} — aucune redémarrée inutilement "
+                f"(version courante vérifiée via « ceph osd "
+                f"metadata »).")
         versions = self.client.ceph_versions()
         shown = False
         for t in ("mon", "mgr", "osd", "mds"):
@@ -2758,6 +4204,7 @@ class CephUpdater:
             if not self.preflight():
                 return
             scan = None
+            ok = False
             if self.action == "minor":
                 # Scan des paquets en attente AVANT toute maintenance :
                 # si aucun nœud n'a rien à faire, on ne pose même pas
@@ -2789,9 +4236,15 @@ class CephUpdater:
                     self.rotate_keys_run()
                 if not self.dry:
                     self.log.info("✔ Action terminée sans erreur.")
+                ok = True
             finally:
                 self._flags_off()
                 self._state_clear()
+                if ok and not self.dry:
+                    # Convergence finale APRÈS retrait des flags :
+                    # le backfill gelé reprend, « clean » devient
+                    # exigible (avertissement sans abort si lent).
+                    self._final_converge()
         except Exception as e:
             # L'erreur est loggée ICI (donc dans le fichier de log) AVANT
             # le bilan — plus jamais d'échec silencieux en exit(2).
@@ -2860,6 +4313,22 @@ def main():
     parser.add_argument("--node",
                         help="Ne traiter que ce nœud (mode mineur "
                              "uniquement).")
+    parser.add_argument("--force-detection-sharding", action="store_true",
+                        help="Phase E de --major (OPT-IN) : tester le "
+                             "sharding RocksDB RÉEL de CHAQUE OSD en la "
+                             "redémarrant UNE PAR UNE (arrêt → "
+                             "ceph-bluestore-tool show-sharding → "
+                             "démarrage), SANS exemption de version — "
+                             "les OSDs déjà sur la release cible sont "
+                             "elles aussi testées. Par DÉFAUT (sans "
+                             "cette option) le sharding n'est PAS "
+                             "testé : la version courante de chaque "
+                             "OSD (« ceph osd metadata ») est lue, un "
+                             "nœud dont toutes les OSDs sont déjà sur "
+                             "la release cible est sauté, les autres "
+                             "sont redémarrées d'un coup via « systemctl "
+                             "restart ceph-osd.target » (une gate par "
+                             "nœud).")
     parser.add_argument("--env-file",
                         default="/etc/proxmox-updater/proxmox.env",
                         help="Fichier d'environnement contenant les "
@@ -2874,6 +4343,9 @@ def main():
                         help="Forcer l'activation des couleurs.")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
+    if args.force_detection_sharding and not args.major:
+        parser.error("--force-detection-sharding n'a de sens qu'avec "
+                     "--major RELEASE")
 
     logger = setup_logger(args.verbose, args.log_file,
                           args.no_color, args.force_color)
@@ -2904,7 +4376,8 @@ def main():
     global API_HOST, API_HOSTS, API_USER, API_TOKEN_NAME, API_TOKEN_VALUE
     global VERIFY_SSL, SSH_USER, SSH_PRIVATE_KEY, SSH_PORT, SSH_KEY_PASSPHRASE
     global SSH_RETRIES
-    global CEPH_STABLE_TIMEOUT, CEPH_MAX_DEGRADED_PGS, CEPH_POLL_S
+    global CEPH_STABLE_TIMEOUT, CEPH_POLL_S
+    global FINAL_CONVERGE_TIMEOUT
     global CEPH_UTIL_MAX_PCT, STATE_FILE, KEY_BACKUP_DIR
     global EST_APT_MIN, EST_UPGRADE_MIN, EST_RESTART_MON_S, EST_RESTART_MGR_S
     global EST_RESTART_OSD_S, EST_RESTART_MDS_S, EST_KEY_ENTITY_S
@@ -2924,8 +4397,8 @@ def main():
     SSH_RETRIES = int(_env("PVE_SSH_RETRIES", str(SSH_RETRIES)))
     CEPH_STABLE_TIMEOUT = int(_env("PVE_CEPH_STABLE_TIMEOUT",
                                    str(CEPH_STABLE_TIMEOUT)))
-    CEPH_MAX_DEGRADED_PGS = int(_env("PVE_CEPH_MAX_DEGRADED_PGS",
-                                      str(CEPH_MAX_DEGRADED_PGS)))
+    FINAL_CONVERGE_TIMEOUT = int(_env("PVE_CEPH_FINAL_CONVERGE_TIMEOUT",
+                                       str(FINAL_CONVERGE_TIMEOUT)))
     CEPH_POLL_S = int(_env("PVE_CEPH_POLL_S", str(CEPH_POLL_S)))
     CEPH_UTIL_MAX_PCT = float(_env("PVE_CEPH_UTIL_MAX_PCT",
                                     str(CEPH_UTIL_MAX_PCT)))
@@ -2964,6 +4437,7 @@ def main():
         "major": args.major,
         "node": args.node,
         "skip_clients": args.skip_client,
+        "force_sharding_detection": args.force_detection_sharding,
     })
     try:
         updater.run()

@@ -16,8 +16,201 @@ Deux scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
   du sharding RocksDB via `ceph-bluestore-tool show-sharding` pendant
   l'arrêt → démarrage sur les nouveaux binaires → gate) : vérité
   terrain du piège META du wiki (OSDs créées sous Octopus), récapitulé
-  au bilan. Et `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
-  re-détectées et sautées). Connexion SSH persistante par nœud
+  au bilan. Le retour « up » de chaque OSD après son redémarrage est
+  vérifié dans le dump RÉEL de `ceph osd dump` (champ « osd », avec
+  repli sur « id » et sur les entiers historiques `up`/`in` : lire le
+  mauvais champ faisait attendre des OSDs pourtant revenues) ; pendant
+  la convergence, la gate attend en NOMMANT les OSDs attendues, et au
+  timeout elle liste celles jamais revenues « up ». Tous les messages
+  de la Phase E (sharding, arrêt/démarrage, gates), de `--rotate-keys`
+  et du bilan affichent l'étiquette `nœud/osd.N` — le serveur à gauche
+  de l'OSD. La bascule du dépôt apt détecte les fichiers RÉELS qui le
+  déclarent (`grep -rls` sur `/etc/apt/sources.list.d/` et
+  `/etc/apt/sources.list`) : le nom n'est pas standardisé (ceph.list,
+  ceph.sources, pveceph.list…) et un sed sur des chemins codés en dur
+  échoue quand ils n'existent pas. Un chemin en erreur (ex.
+  `/etc/apt/sources.list` absent sur un nœud migré 100 % en `.sources`
+  deb822) ne masque PAS les correspondances de l'autre : grep sort 2
+  dans ce cas, mais les fichiers trouvés restent valides. Si aucun
+  fichier n'est trouvé, le
+  run indique la bascule à faire manuellement au lieu d'échouer en
+  plein vol. La santé « effective » des gates filtre le check
+  `OSDMAP_FLAGS` quand il signale EXCLUSIVEMENT des flags de
+  maintenance (`noout`, `nobackfill`…) : posés pendant toute la
+  fenêtre du run, ils maintiennent un WARN permanent — sans ce
+  filtrage, chaque gate attendrait son timeout (30 min) sans pouvoir
+  jamais atteindre HEALTH_OK ; un flag non-maintenance (`pause`,
+  `full`, `noup`…) reste bloquant. Ces mêmes flags GÈLENT le
+  backfill/recovery pendant la fenêtre : les gates exigent donc des
+  PGs **ACTIVES** (pas « clean ») — une PG `active+remapped` doit
+  backfiller POUR revenir sur l'OSD revenue, l'exiger « clean »
+  pendant la fenêtre serait un blocage auto-infligé (cas vécu : osd.0).
+  Le « clean » n'est vérifié qu'en **convergence finale**, APRÈS le
+  retrait des flags (timeout réglable
+  `PVE_CEPH_FINAL_CONVERGE_TIMEOUT`, défaut = `PVE_CEPH_STABLE_TIMEOUT` ;
+  au timeout le run a RÉUSSI, le cluster converge seul). Les logs sont
+  **anti-bruit** : l'avertissement cephx (`PVE_CEPH_ALLOW_AUTH_INSECURE`)
+  et le diagnostic détaillé ne sont (ré)imprimés que si la santé
+  **CHANGE** — les gates pollant toutes les 15 s pendant la fenêtre, un
+  état identique au précédent n'est pas redumpé ; le diagnostic ne
+  liste que les dégradations **BLOQUANTES** (checks `AUTH_INSECURE_*`
+  tolérés et flags de maintenance attendus masqués, signalés par la
+  mention « hors N check(s) toléré(s)/attendu(s) ») ; sur les chemins
+  d'échec (timeout de gate, refus de preflight, échec de rotation),
+  le contexte complet est réimprimé de force — rien n'est perdu en
+  cas de problème réel. Comme « non clean », les checks PG gelés par
+  les flags (`PG_DEGRADED`, `PG_UNDERSIZED` — une PG ressortie
+  dégradée d'un « stuck peering » ne PEUT PAS guérir tant que
+  `norecover`/`nobackfill` sont posés, et les scrubs en retard tant
+  que `noscrub` l'est — vécu : gate condamnée au timeout pendant
+  14 min alors que santé réelle, quorum, PGs actives et OSDs up
+  étaient tous OK) sont **attendus** : ils ne comptent pas dans la
+  santé effective dès que des flags de maintenance sont posés sur
+  le cluster — posés par ce run PENDANT la fenêtre, **ou déjà
+  présents** (le check `OSDMAP_FLAGS` du statut en est la preuve :
+  run précédemment interrompu brutalement, ou administrateur).
+  Vécu : un preflight exigeait la guérison de 2 PG
+  `active+recovery_wait+degraded` que des flags déjà posés
+  empêchaient de guérir — le run était condamné à refuser
+  éternellement. Ces checks restent listés en **WARNING** au
+  preflight (avec « ceph osd dump | grep flags » si les flags ne
+  sont pas de vous), sont re-vérifiés pour de vrai à la
+  **convergence finale** après retrait des flags, et le message de
+  convergence NOMME les checks qui bloquent encore. Hors flags,
+  une PG dégradée reste BLOQUANTE au preflight.
+
+  Même logique pour `OSD_UPGRADE_FINISHED` (« all OSDs are running
+  tentacle or later but require_osd_release < tentacle ») : c'est le
+  signal du monitor que TOUTES les OSDs tournent déjà en release
+  cible — il ne disparaît QUE quand « require-osd-release » est
+  relevé, ce que le run ne fait qu'en Phase G (APRÈS les MDS, ordre
+  du wiki Proxmox). L'exiger HEALTH_OK à la gate de la Phase E
+  attendait une condition que le run lui-même ne crée qu'à la fin
+  (vécu : restart ceph-osd.target, OSDs up/quorum complet/PGs
+  actives tous OK, > 5 min de polls sur ce SEUL check restant, run
+  tué au Ctrl-C avant la phase MDS). Il est donc **attendu** si (et
+  seulement si) la release qu'il nomme est la CIBLE du run `--major`
+  ; déjà présent au preflight (reprise d'un run tué avant la Phase
+  G), il est toléré et listé en WARNING (« require_osd_release » pas
+  encore relevé) ; la Phase G le pose, puis la convergence finale
+  re-vérifie la santé réelle une fois le check disparu. Hors run
+  `--major` vers cette release (mode mineur, rotate-keys, montée
+  précédente inachevée), il reste BLOQUANT. La Phase E est **idempotente à la reprise** : la
+  version COURANTE de chaque daemon OSD (`ceph osd metadata`) est
+  lue avant la passe — un nœud dont TOUTES les OSDs tournent déjà
+  sur la release cible est SAUTÉ (aucun restart inutile, pas de gate
+  re-subie) ; sinon ses OSDs sont redémarrées d'un coup via
+  `systemctl restart ceph-osd.target` (une seule gate par nœud —
+  plus rapide, impact plus large : aucune OSD du nœud ne sert d'IO
+  pendant le restart). Le même version-check s'applique désormais
+  aux MONs, MGRs et MDS en mode `--major` : la version COURANTE de
+  chaque daemon est lue avant tout restart — un daemon qui tourne
+  déjà sur la release cible est SAUTÉ (« tourne déjà en … — rien à
+  faire »). Source 1 : `ceph tell <type>.<id> version` ; source 2
+  (repli) : `ceph <type> metadata`, listé par le mon pour TOUS les
+  daemons du type — les mgrs STANDBY ne répondent pas tous au tell
+  (vécu : 2 mgrs sur 3 déjà en cible annoncés à tort « à
+  redémarrer » en dry-run). C'est une preuve, pas une hypothèse :
+  un daemon qui tourne sur la cible a déjà été redémarré après
+  l'upgrade des paquets. Les DEUX sources illisibles →
+  avertissement EXPLICITE puis restart quand même (échec sûr) —
+  jamais de « à redémarrer » sans avoir vérifié la version. En
+  mode mineur (patch) les restarts restent inconditionnels. En
+  DRY-RUN, `apt-get update -q` est exécuté RÉELLEMENT sur chaque
+  nœud (sans risque : il ne rafraîchit que le cache des paquets
+  disponibles), suivi de `apt-get -s full-upgrade` (simulation
+  pure) qui AFFICHE les paquets réellement en attente — Ceph
+  détaillés, plus le décompte des non-Ceph (full-upgrade est
+  global) ; le full-upgrade lui-même reste simulé. En EXÉCUTION,
+  c'est cette MÊME simulation (lecture pure, lancée après le vrai
+  `apt-get update -q`) qui décide : si elle n'a RIEN à faire, le
+  `apt-get full-upgrade` n'est PAS lancé du tout (vécu : 3
+  « 0 upgraded, 0 newly installed » streamés pour rien sur des
+  nœuds déjà à jour) ; si elle est illisible, le full-upgrade est
+  lancé quand même (échec sûr — on ne saute JAMAIS une upgrade sur
+  une lecture manquée). Le test du sharding RocksDB par OSD (piège
+  META du wiki, il exige l'arrêt INDIVIDUEL de chaque OSD) est un
+  OPT-IN explicite `--force-detection-sharding` (`--major`
+  uniquement) : OSDs redémarrées UNE PAR UNE (arrêt → show-sharding
+  → démarrage), SANS exemption de version — la date de création des
+  répertoires n'est qu'une heuristique, la vérité terrain est ce
+  test (sinon surveillez la colonne META de `ceph osd df`). Les flags
+  orphelins d'un run précédent interrompu sont **adoptés** puis
+  retirés à la fin — MÊME si ce run s'interrompt à son tour (un
+  écrasement de variable les perdait, les laissant en place à vie) ;
+  les flags posés par un administrateur restent en place et le bilan
+  liste les commandes `ceph osd unset` exactes pour les retirer. Les vérifications post-restart qui
+  dépendent du CONSENSUS (`min_mon_release` de la monmap après le
+  dernier MON, élection du MGR actif) sont POLLÉES jusqu'à 5 min
+  (configurable) : leur mise à jour automatique prend quelques
+  secondes, et un check immédiat lirait l'ancien état. Le fichier
+  d'état accepte aussi un chemin relatif (répertoire créé seulement
+  s'il y en a un). Les MDS suivent la procédure wiki par daemon : actives
+  identifiées via `ceph fs dump` (fiable en multi-FS, décodage
+  tolérant aux lignes traînées par la CLI — « dumped fsmap epoch
+  N » imprimé après le JSON — qui sinon faisait avorter le run en
+  Phase F), standbys
+  arrêtées unité par unité, actives redémarrées en dernier — jamais de
+  stop/start de `ceph-mds.target` ; une MDS dont la version courante
+  est déjà la cible (standby ou active) est SAUTÉE, rendant la Phase F
+  idempotente à la reprise. Et `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
+  re-détectées et sautées) : ses vérifications « check AUTH_INSECURE_*
+  disparu » (étapes 7/8/9/12) sont POLLÉES jusqu'à
+  `PVE_CEPH_ROTATE_CHECK_TIMEOUT_S` (défaut 120 s) — le health check
+  est recalculé ASYNCHRONEMENT par les mons, une lecture immédiate
+  relisait l'état d'avant la dernière rotation (vécu : FATAL 7 s
+  après la rotation de la DERNIÈRE MDS alors que le check avait
+  disparu une seconde plus tard) ; un FATAL après timeout garde le
+  run relançable, la reprise ne traite que le reste. L'étape 10
+  (rotation de `client.admin`) importe la nouvelle clé dans chaque
+  keyring admin VIA la clé de secours `client.admin-backup` qui vient
+  d'être créée — après la rotation, les keyrings locaux ne contiennent
+  plus que l'ANCIENNE clé invalidée, et un `ceph auth get client.admin`
+  par la CLI locale échoue en `RADOS permission denied` (vécu : FATAL
+  11:40, CLI admin de tout le cluster coupée) ; le keyring de secours
+  est DIFFUSÉ vers les autres nœuds le temps de l'import (puis
+  supprimé), et si le keyring de secours est illisible la rotation est
+  REFUSÉE avant d'avoir cassé quoi que ce soit. La détection des
+  keyrings admin couvre le keyring AUTHORITATIF de Proxmox VE —
+  `/etc/pve/priv/ceph.client.admin.keyring`, celui que lit la CLI
+  `ceph` du root — ainsi que `/etc/pve/priv/ceph.mon.keyring` (mon. +
+  client.admin : l'import par entité de `ceph-authtool` remplace
+  client.admin sans toucher à mon.), la copie `/etc/ceph/…` et les
+  keyrings des storages `/etc/pve/priv/ceph/*.keyring` (vécu 12:29 :
+  importer dans `/etc/ceph/…` et le keyring du storage ne répare PAS
+  la CLI — `ceph -s` reste en `monclient(hunting):
+  handle_auth_bad_method … (13) Permission denied` tant que
+  l'authoritatif garde l'ancienne clé) ; `ceph -s` est vérifié sur
+  CHAQUE nœud après les imports. Enfin, la reprise
+  détecte une clé de secours ORPHELINE (run interrompu avant sa
+  suppression : une backdoor `mon allow *`) et la supprime, ET
+  vérifie que les keyrings LOCAUX contiennent bien la clé
+  `client.admin` COURANTE de l'auth DB — la reprise juge l'étape
+  acquise sur l'auth DB seule, or un run interrompu à l'étape 10 +
+  une réparation manuelle partielle laissent des keyrings locaux
+  périmés : sur Proxmox VE, les storages CephFS/RBD de
+  `/etc/pve/priv/ceph/<storage>.keyring` authentifient par ces
+  fichiers (vécu 13:0x : les 4 storages CephFS « non Active » après
+  un run pourtant terminé en santé OK) ; chaque keyring divergent
+  est ré-importé (idempotent), les frais ne sont pas retouchés.
+  Et les storages CephFS de PVE sans `username` explicite gardent la
+  clé de `client.admin` dans `/etc/pve/priv/ceph/<STORAGE_ID>.secret`
+  — la clé NUE (pas un keyring, donc invisible pour la détection par
+  section `[client.admin]`) : après rotation de `client.admin`, le
+  storage reste coupé tant que le `.secret` n'est pas régénéré
+  (« A CephFS storage holds only the bare key » — doc PVE) ; le script
+  régénère désormais ces `.secret` dans le flux normal de l'étape 10
+  (après les imports) ET à la reprise (vécu 13:1x : 4 storages CephFS
+  « non Active », `pvesm` en timeout, cluster pourtant HEALTH_OK). À l'étape
+  11, le keyring local `bootstrap-<type>`
+  (`/var/lib/ceph/<type>/ceph.keyring`) n'est mis à jour QUE là où le
+  répertoire du service existe déjà — sur un cluster sans rbd-mirror
+  ni rgw déployés, ces répertoires n'existent pas et l'écriture
+  échouerait en `No such file or directory` (vécu 12:52 : FATAL à la
+  distribution de `client.bootstrap-rbd` alors que sa rotation dans
+  l'auth DB avait RÉUSSI) ; les services non déployés sont donc
+  sautés avec un message explicite, comme pour `client.crash`.
+  Connexion SSH persistante par nœud
   (`PVE_SSH_RETRIES`), stderr capturé dans le fichier de log, bilan
   signalant explicitement les runs interrompus — voir son docstring.
 
@@ -127,13 +320,21 @@ python3 proxmox_rolling_update.py --execute \
 Le fichier env est **obligatoire** (`--env-file`, défaut
 `/etc/proxmox-updater/proxmox.env`) : sans lui le script s'arrête.
 
+**Version du script** : la **première ligne de chaque run** (console ET
+fichier de log) affiche `proxmox-rolling-update — version <N>`, et la
+bannière reprend `v<N>` — c'est le moyen fiable de vérifier QUELLE
+version tourne sur un cluster donné (une copie périmée a déjà été prise
+pour une version à jour). Le numéro est la constante `SCRIPT_VERSION`
+en tête du script, à incrémenter à chaque publication.
+
 ## Déroulé du run
 
 **Étape 0 — Pré-vérifications** : lecture pure (quorum corosync, versions
 PVE par nœud, ressources HA et règles d'affinité, état Ceph). Si un run
 précédent s'est arrêté avant d'avoir tout restauré, un fichier d'état est
 détecté et la **récupération** s'exécute (voir plus bas). En dry-run,
-simple rapport.
+simple rapport — sauf pour les règles `node-affinity` du fichier d'état,
+qui sont réactivées POUR DE VRAI (cf. ci-dessous).
 
 **Étape 1 — par nœud** (dans l'ordre du cluster) :
 - `apt update` + diagnostic espace disque : besoin estimé
@@ -142,6 +343,53 @@ simple rapport.
   sauté, ni évacuation ni reboot.
 - Détachement HA (`ignored` + label, état d'origine mémorisé) puis mode
   maintenance HA.
+- **Mise en sommeil temporaire de TOUTES les règles `node-affinity`**
+  du cluster (une seule fois par run, définitions intactes) : ni le
+  planning du script ni le CRM ne subissent de préférence/contrainte
+  node-affinity pendant TOUTE l'Étape 1 — une règle `strict=1` ne peut
+  plus bloquer l'évacuation du nœud, et le CRM ne décide plus de relocate
+  à chaque sortie de maintenance (churn en pleine évacuation du nœud
+  suivant). Les règles sont restaurées à la FIN de l'Étape 1,
+  avant le rapatriement/rééquilibrage, qui redeviennent contraints par les
+  règles ; en mode `--node`, la fin d'Étape 1 est la sortie de maintenance
+  du nœud. Les règles déjà désactivées par un admin ne sont pas touchées ;
+  les `resource-affinity` (« keep separate » / « together ») ne sont
+  **jamais** touchées : contraintes de sécurité, actives du début à la
+  fin. Les mises en sommeil sont persistées dans le fichier d'état.
+  **Mode adapté au schéma de l'API PVE** (constat d'un run réel sur
+  PVE 9.1/9.2 : le schéma des règles est type-dépendant, le PUT EXIGE
+  `type` et peut refuser `disable`) — cascade par règle, le mode qui
+  fonctionne étant mémorisé pour tout le run : 1. `disable=1` (PUT
+  `type`+`disable=1`) ; 2. à défaut, `resources=""` (PUT `type`+`resources`
+  vides : la règle ne s'applique plus à rien, définition conservée) ;
+  3. à défaut, suppression temporaire (DELETE, recréation à l'identique
+  à la restauration). **Chaque PUT est VÉRIFIÉ par re-lecture** : sur
+  PVE 9, un PUT accepté (HTTP 200) peut rester SANS EFFET côté HA
+  Manager (bug officiel — cf. correctif pve-manager ≥ 9.0.7) ; si
+  l'effet n'est pas constaté, la cascade continue vers le mode
+  suivant au lieu de croire le code retour. La restauration applique
+  le mode inverse : pour le mode `disable`, la réactivation
+  **SUPPRIME la propriété `disable`** (PUT `type` + `delete=disable`,
+  le paramètre standard des PUT PVE) avec `disable=0` en repli pour un
+  PVE antérieur — car depuis un changement du HA Manager PVE 9,
+  `disable=0` seul **ne réactive plus** une règle désactivée (le PUT
+  est accepté mais reste sans effet : constat d'un run réel, c'est le
+  bug officiel corrigé côté GUI) ; l'effet est ensuite **vérifié par
+  re-lecture**, et un échec réel devient une ERROR explicite (la règle
+  reste dans le fichier d'état, le prochain run la réactivera) — plus
+  jamais de « réactivée ✔ » de façade. Pour les autres modes :
+  ressources d'origine rendues à la règle (fusion avec les ressources
+  courantes), ou recréation par POST (`rule`, pas `rid`).
+  **En dry-run, ces mises en sommeil/restaurations sont effectuées POUR DE
+  VRAI** : c'est une action réversible
+  et sans effet de bord — retirer une préférence ne déplace aucune
+  ressource, et une restauration sur des placements conformes n'en
+  déplace pas non plus — et c'est le seul moyen de tester le mécanisme
+  avant le run réel. Tout le reste du dry-run (migrations, apt, reboot,
+  maintenance, détachement HA) reste simulé ; le fichier d'état trace
+  ces actions réelles (un dry-run interrompu par Ctrl-C est donc
+  rattrapé au run suivant), en préservant toute section d'un run
+  `--execute` interrompu.
 - **Plan de migration** affiché (quelle VM va où, impact RAM/CPU estimé,
   affinités respectées), puis migrations réelles, en respectant les marges
   de sécurité RAM (AUTO : `min(max(10 % × RAM, 8 G), 48 G, 30 % × RAM)`)
@@ -161,19 +409,60 @@ simple rapport.
   (2f-bis, voir section Ceph).
 - `finally` en **tout état de cause** : retrait des flags Ceph, sortie de
   maintenance, réactivation des ressources HA dans leur état d'origine,
-  fenêtre de stabilité CRM de 60 s. L'état est persisté dans le JSON à
-  chaque mutation.
+  fenêtre de stabilité CRM de 60 s (les règles `node-affinity` restent
+  désactivées jusqu'à la fin de l'Étape 1, sauf en mode `--node` où elles
+  sont réactivées ici). L'état est persisté dans le JSON à chaque
+  mutation.
 
-**Étape 2 — Rééquilibrage final** : les VMs (HA détachées temporairement
-pour piloter les migrations) sont repositionnées pour minimiser l'écart
+**Étape 2 — Rééquilibrage final** : AVANT l'optimisation RAM, un
+**rapatriement des hors-règle** ramène sur un nœud de leur règle
+node-affinity toute ressource HA qui s'y trouve encore — repli
+strict=0 pendant une évacuation, OU déplacement pendant le sommeil
+des règles (une VM de règle mono-nœud est forcément déplacée hors
+règle quand son nœud est évacué), règle soft comme DURE, VM running
+(le CRM la re-migrerait au dégel) comme stopped (migration hors
+ligne : elle sera conforme à sa prochaine mise en route, `onboot=1`
+compris). Le rééquilibrage optimise ensuite AUTOUR de ce placement
+conforme : les VMs (HA détachées temporairement pour piloter les
+migrations) sont repositionnées pour minimiser l'écart
 de pression RAM entre nœuds (optimum théorique approché, avec tolérance
 d'un point) ; les nœuds vides sont d'abord remplis (résilience), puis
 l'écart optimisé. CPU surveillé (≤ 80 %). Skip si Ceph n'est pas
-HEALTH_OK (sauf `PVE_CEPH_ALLOW_WARN=1`).
+HEALTH_OK (sauf `PVE_CEPH_ALLOW_WARN=1`). Si aucun nœud de la règle ne
+respecte la marge RAM/CPU au moment de la **1re passe** de
+rapatriement : la ressource reste sur place (WARNING) et le message
+annonce qu'une **SECONDE passe de rapatriement** sera rejouée
+**après le rééquilibrage** (dans la même fenêtre de gel CRM, avant le
+dégel) : les migrations du rééquilibrage peuvent avoir **libéré** le
+nœud de règle qui était saturé à la première passe (cas réel : des
+DUREs échouaient AVANT le rééquilibrage, leurs nœuds de règle
+reprenaient de la place juste après) — elles sont ramenées à ce
+moment-là (mention « 2e passe post-rééquilibrage » dans le log) et le
+dégel final n'a vraiment plus rien à corriger. Si la seconde passe
+échoue aussi, la ressource reste hors règle : le CRM décidera au
+dégel — relocalisation certaine pour une règle DURE, probable pour
+une soft (comportement attendu, pas une anomalie).
 
 **Bilan final** : tables d'occupation avant/après, synthèse des
 migrations et upgrades. En dry-run s'y ajoute l'estimation de durée
 (voir [Estimations du dry-run](#estimations-du-dry-run-et-statistiques-de-durées)).
+
+**Sémantique RAM des tables (v9)** : chaque ligne d'hyperviseur porte
+DEUX métriques distinctes. À l'**état initial**, « **RAM réelle** » est
+la mémoire **consommée mesurée** du nœud, et « **Σ déclarée** » la somme
+des RAM max des guests *running* — la **pression** anti-overcommit que
+le run répartit. À l'**état final** (dry-run, état simulé), « **RAM
+(pression)** » est cette **pression déclarée du modèle** (égale à « Σ
+déclarée »), **pas** un usage mesuré : l'état final s'apprécie donc sur
+cette métrique, à comparer à « Σ déclarée » de l'état initial, **pas**
+à « RAM réelle ». Ne pas confondre les deux donnait l'illusion que la
+mémoire des nœuds « gonflait » (~50 % d'usage réel initial ➔ ~85 % de
+pression déclarée final) alors qu'une migration **déplace** la mémoire,
+elle ne la crée pas : la consommation réelle du cluster est inchangée.
+Un « NB : » sous les bandeaux ÉTAT INITIAL et ÉTAT FINAL rappelle
+cette sémantique dans le log. En run `--execute` ayant modifié le
+cluster, l'état final est **re-lu** après la fenêtre de stabilité CRM :
+il montre alors l'usage réel mesuré, sans NB.
 
 ## Sécurités intégrées
 
@@ -183,9 +472,25 @@ migrations et upgrades. En dry-run s'y ajoute l'estimation de durée
   immédiat.
 - **Bascule automatique de l'hôte API** (y compris préventive avant le
   reboot du nœud hébergeant l'API).
-- **Affinités HA** : les règles `node-affinity` sont traitées comme
-  STRICTES pour le placement ; les contraintes internes du CRM ne sont
-  pas contournées pendant les migrations (c'est le but du détachement).
+- **Affinités HA** : TOUTES les règles `node-affinity` du cluster sont
+  mises **en sommeil** (mode adapté au schéma de l'API PVE : `disable=1`,
+  sinon ressources vidées, sinon suppression temporaire ; définitions
+  intactes) pendant toute
+  l'Étape 1 — sans cela, une règle `strict=1` peut bloquer l'évacuation
+  et le `apt full-upgrade` avec lui, et le CRM décide des relocate à
+  chaque sortie de maintenance. Restauration à la fin de
+  l'Étape 1, avant le rééquilibrage : un seul point de failback, au
+  moment où le cluster est de nouveau complet — réactivation PVE 9 par
+  **suppression du flag `disable`** (`disable=0` ne suffit plus),
+  chaque mise en sommeil et chaque restauration **vérifiées par
+  re-lecture** (un PUT accepté sans effet déclenche la cascade ou une
+  ERROR explicite). Les `resource-affinity`
+  (« keep separate ») ne sont jamais contournées : elles restent
+  contraignantes du début à la fin. La reprise d'un fichier d'état de
+  l'ANCIENNE version (retrait de VMs des règles) crée la règle manquante
+  par POST **uniquement si aucune règle équivalente n'existe déjà** :
+  une règle recréée manuellement (autre identifiant, mêmes nœuds,
+  ressources couvrantes) est détectée et AUCUN doublon n'est créé.
 - **Gate espace disque** avant toute évacuation (pas d'upgrade qui remplit
   la racine d'un nœud vidé… ou pire, pas vide).
 - **Marges RAM AUTO** par nœud + plafond CPU 80 %.
@@ -209,16 +514,58 @@ migrations et upgrades. En dry-run s'y ajoute l'estimation de durée
   d'hôte API (l'appel `agent.ping` est proxifié vers l'hébergeur de la
   VM : tous les hôtes échoueraient à l'identique — sans ce cas, chaque
   VM sans agent vivant déclencherait un carrousel complet des ~10 hôtes).
+- **Tâches « WARNINGS: n » = RÉUSSIE (v13)** : Proxmox termine une
+  tâche avec `exitstatus: WARNINGS: 1` quand elle a RÉUSSI mais de
+  façon non silencieuse (ex. backup avec avertissement, migration avec
+  remarque) — seul `ERROR` est un échec (règle Proxmox
+  `upid_status_is_error`). La v12 cassait le run pour un simple
+  avertissement. Désormais : les lignes `WARNING:` du log de la tâche
+  sont remontées (3 max, puis renvoi vers
+  `pvesh get /nodes/<nœud>/tasks/<upid>/log`), la migration est
+  considérée réussie et le run continue ; `ERROR` échoue toujours
+  immédiatement.
+- **Compatibilité QEMU/machine pendant le rolling upgrade (v13)** :
+  une VM démarrée sur un nœud déjà upgradé peut résoudre une machine
+  que les nœuds pas encore upgradés refusent
+  (« Installed QEMU version '10.1.2' is too old to run machine type
+  'pc-i440fx-11.1+pve0', please upgrade node '…' » — la migration est
+  alors REFUSÉE par PVE en pleine évacuation). À chaque inventaire,
+  une sonde SSH par nœud lit (1) la version du binaire QEMU et (2) la
+  machine **réellement exécutée** par chaque VM démarrée dans `ps`
+  (l'alias `pc`/`q35` de la config y est déjà résolu en
+  `pc-i440fx-X.Y+pveN` — seule façon fiable, `qm listmachines`
+  n'existe pas). Le placement ne propose alors chaque VM qu'à des
+  nœuds dont le QEMU sait exécuter sa machine ; les invités arrêtés
+  ne sont pas migrés (ils restent sur place, reboot inclus) et ne
+  sont donc pas contraints. Si **aucune** cible ne sait l'exécuter,
+  le run s'arrête avec la remédiation : figer la machine après arrêt
+  (`qm set <vmid> --machine <famille>-<X.Y>`, non changeable à chaud),
+  laisser la VM arrêtée pendant le run, ou upgrader d'abord un nœud
+  cible. Le préflight signale l'hétérogénéité QEMU dès l'Étape 0 ;
+  un nœud que la sonde n'a pas pu interroger reste **permissif**
+  (aucune contrainte ajoutée : le garde-fou natif de PVE s'applique
+  toujours au moment de la migration). Aucune nouvelle variable
+  d'environnement : le comportement est automatique.
 
 ## Reprise après interruption
 
 Run tué (`kill -9`, coupure) ⇒ le fichier d'état JSON
 (`proxmox-rolling-update.state.json`) contient l'état zéro : ressources
-HA détachées (avec état et comment d'origine), nœuds en maintenance, flags
-Ceph posés. Au lancement suivant, l'Étape 0 détecte ce fichier et
-restaure tout automatiquement (les flags Ceph sont globaux : le retrait
-essaie chaque nœud jusqu'à trouver un SSH joignable), puis le run
-repart. Un `Ctrl-C` traverse les `finally` : l'état zéro est restauré
+HA détachées (avec état et comment d'origine), règles `node-affinity`
+désactivées (définitions d'origine persistées), nœuds en maintenance,
+flags Ceph posés. Au lancement suivant, l'Étape 0 détecte ce fichier et
+restaure tout automatiquement (règles d'affinité d'abord, pour que le
+CRM applique les préférences dès la réactivation des ressources ; les
+flags Ceph sont globaux : le retrait essaie chaque nœud jusqu'à trouver
+un SSH joignable), puis le run repart. En dry-run, la reprise réactive
+AUSSI pour de vrai les règles `node-affinity` du fichier (PUT réels et
+réversibles, réactivation par suppression du flag `disable` et effet
+vérifié par re-lecture) ; ressources HA, maintenance et flags restent simulés.
+La reprise accepte AUSSI les
+fichiers d'état de l'ancienne version (ressources retirées des règles,
+règle éventuellement supprimée) : la règle manquante est recréée via
+POST avec l'identifiant `rule` du schéma PVE 9 — sauf si une règle
+équivalente a été recréée entre-temps (anti-doublon). Un `Ctrl-C` traverse les `finally` : l'état zéro est restauré
 avant même de rendre la main, et le script termine proprement (message
 « Interruption utilisateur », code de sortie 130) au lieu d'un traceback
 brut.
@@ -277,6 +624,35 @@ Si le cluster a du Ceph (détection automatique, silencieuse sinon) :
      toléré, la récupération continue en arrière-plan — indispensable
      sur un gros cluster où le recovery peut durer des heures ;
   3. **HEALTH_OK** → succès.
+- **MON_CLOCK_SKEW, auto-remédiation (v12)** : après le reboot d'un
+  nœud (upgrade noyau), Ceph passe couramment en `HEALTH_WARN` «
+  `mon.<nœud> clock skew 0.157s > max 0.05s` » — le mon du nœud qui
+  revient mesure une horloge encore décalée (RTC au boot, chrony pas
+  resynchronisé). Le warning part seul une fois l'horloge d'aplomb
+  (les mons ré-évaluent au `mon_timecheck_skew_interval`, ~30 s), MAIS
+  un chrony lent/coincé laissait le run échouer à la gate pour un
+  problème d'**horloge**, bénin pour le stockage (vécu : verdict
+  « mon/OSD probablement tombé » sur un cluster parfaitement sain).
+  La ligne du health **nomme le coupable** (`mon.<nœud>` = le nœud,
+  sur PVE le mon porte le nom de son hôte) : le script lit l'état
+  chrony de ce nœud (`systemctl is-active chrony` + `chronyc
+  tracking`, une seule commande SSH) et applique, dans l'ordre :
+  `systemctl restart chrony` si le service est inactif ou
+  désynchronisé ; `chronyc makestep` s'il est synchronisé mais
+  l'offset dépasse 0.05 s (le rattrapage progressif laisse le
+  warning vivre des minutes) ; **rien** si l'horloge est déjà juste
+  (reliquat : les mons ré-évalueront seuls) ; puis attend la
+  ré-évaluation des mons. **Dernier recours** uniquement : `systemctl
+  restart ceph-mon@<nœud>`, si (et seulement si) l'horloge est prouvée
+  juste ET que le quorum garde la majorité **stricte** — refusé à 2
+  mons (sans majorité, tout le cluster figerait ses IO), désactivable
+  via `PVE_CEPH_CLOCK_MON_RESTART=0`. La remédiation agit aux DEUX
+  gates (post-reboot **et** avant évacuation d'un cluster resté
+  skewé d'un reboot antérieur). En dry-run : rien n'est exécuté, le
+  check est toléré avec l'explication de ce que le run réel ferait.
+  `mon_clock_drift_allowed` n'est JAMAIS relevé (déconseillé par la
+  documentation Ceph). Prévention durable : `makestep 1.0 3` dans
+  `chrony.conf` fait sauter l'heure d'office au boot.
 - **Diagnostic détaillé** (codes des checks, sévérité, résumé, 3
   détails) loggé à chaque état non-OK rencontré.
 
@@ -369,8 +745,14 @@ Détails d'implémentation :
 | `PVE_WITH_LOCAL_DISKS` | `true` | Migrer les disques locaux des VMs |
 | `PVE_CEPH_ALLOW_WARN` | `0` | Tolérer HEALTH_WARN aux gates Ceph (risqué) |
 | `PVE_CEPH_ALLOW_AUTH_INSECURE` | `0` | Tolérer les avis cephx AUTH_INSECURE_* (CVE-2025-30156, Ceph ≥ 19.2.6) |
+| `PVE_CEPH_ROTATE_CHECK_TIMEOUT_S` | `120` | Attente de propagation des checks AUTH_INSECURE_* après chaque étape de `--rotate-keys` (recalcul asynchrone des mons, s) |
 | `PVE_CEPH_POSTBOOT_TIMEOUT` | `300` | Attente de convergence après reboot (s) |
 | `PVE_CEPH_READY_TIMEOUT` | `900` | Attente HEALTH_OK avant évacuation/reboot (s) |
+| `PVE_CEPH_CLOCK_SKEW_MAX_S` | `0.05` | Seuil d'offset horloge déclenchant `chronyc makestep` (=`mon_clock_drift_allowed`, s) |
+| `PVE_CEPH_CLOCK_CHRONY_TIMEOUT_S` | `120` | Attente de resynchronisation chrony après son restart (remédiation MON_CLOCK_SKEW, s) |
+| `PVE_CEPH_CLOCK_REEVAL_TIMEOUT_S` | `150` | Attente de la ré-évaluation de MON_CLOCK_SKEW par les mons avant tout restart de mon (s) |
+| `PVE_CEPH_CLOCK_MON_REJOIN_TIMEOUT_S` | `180` | Attente du retour du mon dans le quorum après son restart (dernier recours, s) |
+| `PVE_CEPH_CLOCK_MON_RESTART` | `1` | `0` : interdire le restart du mon en dernier recours (chrony/makestep restent actifs) |
 | `PVE_EST_MIGRATE_SPEED_MBPS` | `250` | Débit effectif d'une migration live (Mo/s), bilan dry-run |
 | `PVE_EST_MIGRATE_OVERHEAD_S` | `60` | Overhead fixe par migration (s), bilan dry-run |
 | `PVE_EST_APT_MIN` | `2` | apt update + simulation (min/nœud), bilan dry-run |
