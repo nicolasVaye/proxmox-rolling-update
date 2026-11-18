@@ -42,7 +42,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "13"
+SCRIPT_VERSION = "14"
 
 import argparse
 import json
@@ -982,6 +982,24 @@ def _qemu_version(version: Optional[str]) -> Optional[Tuple[int, int]]:
     if not m:
         return None
     return (int(m.group(1)), int(m.group(2) or 0))
+
+
+def _check_summary_text(summary) -> str:
+    """Normalise le « summary » d'un check de santé Ceph en TEXTE.
+    PVE 9.x le renvoie comme OBJET {"message": "...", "severity": ...}
+    (format dominant de /cluster/ceph/status), mais d'autres versions /
+    chemins l'ont déjà renvoyé en chaîne brute : passer l'un ou l'autre
+    directement à re.search passait le dict entier et levait « expected
+    string or bytes-like object, got 'dict' » (crash v13 du 18/11,
+    gate post-reboot de p-proxpra-c01). Un point unique de normalisation
+    pour les TROIS sites qui parsent ce champ."""
+    if isinstance(summary, dict):
+        s = summary.get("message")
+    else:
+        s = summary
+    if s is None:
+        return ""
+    return s if isinstance(s, str) else str(s)
 
 
 # ---------------------------------------------------------------------------
@@ -2820,7 +2838,7 @@ class ProxmoxClient:
             return
         for code, c in sorted(checks.items()):
             sev = c.get("severity", "?")
-            msg = ((c.get("summary") or {}).get("message") or "").strip()
+            msg = _check_summary_text(c.get("summary")).strip()
             self.log.warning(f"    {code} [{sev}] : {msg}")
             for d in (c.get("detail") or [])[:3]:
                 dm = ((d.get("message") or "").strip()
@@ -3041,7 +3059,7 @@ class ProxmoxClient:
         for code, c in sorted(checks.items()):
             if code != "MON_CLOCK_SKEW":
                 continue
-            msgs = [((c.get("summary") or {}).get("message") or "")]
+            msgs = [_check_summary_text(c.get("summary"))]
             msgs += [d.get("message") or ""
                      for d in (c.get("detail") or [])]
             for m in msgs:
@@ -4228,9 +4246,18 @@ class ProxmoxClient:
                 pgm = s.get("pgmap") or {}
                 deg = pgm.get("degraded_objects")
                 if deg is None:
-                    summ = ((s.get("health") or {}).get("checks")
-                            or {}).get("PG_DEGRADED", {}).get("summary", "")
-                    m = re.search(r"(\d+)/\d+ objects degraded", summ)
+                    # PVE 9.x : le « summary » d'un check Ceph du status
+                    # est un OBJET {"message": "...", "severity": ...},
+                    # PAS une chaîne — cf. _check_summary_text. Crash v13
+                    # du 18/11 (nœud c01) : status de fin de recovery où
+                    # pgmap.degraded_objects est ABSENT du payload alors
+                    # que le check PG_DEGRADED est encore présent → le
+                    # dict entier partait dans re.search. On normalise
+                    # AVANT le parse, qu'importe la représentation.
+                    raw = _check_summary_text(
+                        ((s.get("health") or {}).get("checks")
+                         or {}).get("PG_DEGRADED", {}).get("summary", ""))
+                    m = re.search(r"(\d+)/\d+ objects degraded", raw)
                     if m:
                         deg = int(m.group(1))
                 return (nq, nmon, osdm.get("num_up_osds"),
