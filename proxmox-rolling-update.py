@@ -42,9 +42,10 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "14"
+SCRIPT_VERSION = "15"
 
 import argparse
+import base64
 import json
 import logging
 import re
@@ -1000,6 +1001,220 @@ def _check_summary_text(summary) -> str:
     if s is None:
         return ""
     return s if isinstance(s, str) else str(s)
+
+
+# ---------------------------------------------------------------------------
+# /etc/hosts — AUDIT DE COHÉRENCE INTER-NOEUDS (v15)
+#
+# Chaque /etc/hosts d'un nœud doit permettre de résoudre TOUS les nœuds
+# du cluster par leur nom court (corosync, migrations live, ceph, ssh
+# inter-nœuds s'appuient dessus quand le DNS n'a pas réponse). Format
+# de référence (vécu sur le cluster SPV) :
+#     10.158.15.70   p-c4-proxspv-21.mgmt-esx.dc.u-bordeaux.fr   p-c4-proxspv-21
+# Règles de l'audit, appliquées nœud PAR nœud sur le fichier ENTIER :
+#   - MANQUANT : un nœud du cluster n'apparaît nulle part par son nom
+#     court (ni en alias) → correction : ligne « IP FQDN nom » ajoutée
+#     en fin de fichier ;
+#   - INCOHÉRENT : le nom est présent mais pointe une IP ≠ l'IP de
+#     gestion connue de l'API (ou alias court absent d'une ligne qui ne
+#    porte que le FQDN — getent ne résout alors PAS le nom court) →
+#     correction : IP de la ligne remplacée / alias court ajouté ;
+#   - DOUBLON : le nom figure sur plusieurs lignes → correction : une
+#     seule ligne conservée, les autres mises en commentaire ;
+#   - OBSOLÈTE : entrée qui RESSEMBLE à un nœud de CE cluster (même
+#     préfixe de famille, ex. « p-c4-proxspv- » + numéro) sans être un
+#     nœud actuel (ex-nœud retiré du cluster) → correction : mise en
+#     COMMENTAIRE (jamais effacée — reversible, trace datée).
+#
+# Prudence volontaire : tout ce qui ne matche pas la famille des noms
+# actuels (autres clusters, serveurs de backup/stockage, VIP…) est
+# IGNORÉ — l'outil ne connaît QUE le cluster qu'il met à jour.
+# Les corrections en mode --execute passent par une sauvegarde datée
+# (/etc/hosts.proxmox-rolling-update.bak-AAAAMMJJ-HHMMSS) puis une
+# ré-écriture atomique par base64 (pas d'échappement de shell
+# possible), suivie d'une relecture de vérification.
+# ---------------------------------------------------------------------------
+
+def hosts_family_prefixes(names) -> Set[str]:
+    """Préfixes de « famille » des noms de nœuds : le nom sans ses
+    chiffres finaux (« p-proxpra-a01 » ➔ « p-proxpra-a », « p-c4-proxspv-21 »
+    ➔ « p-c4-proxspv- »). Sert UNIQUEMENT à reconnaître, dans un
+    /etc/hosts, les entrées qui ressemblent à un nœud de CE cluster
+    (ex-nœud retiré du cluster mais resté dans les fichiers) : on ne
+    touche à RIEN qui ne matche pas."""
+    out: Set[str] = set()
+    for n in names or []:
+        m = re.match(r"^(.*\D)(\d+)$", str(n).strip())
+        if m and m.group(1):
+            out.add(m.group(1).lower())
+    return out
+
+
+def _hosts_entries(content: str) -> List[Dict]:
+    """Lignes actives de /etc/hosts : [{idx, ip, aliases, raw}] — les
+    commentaires (IPv6 désactivé, etc.) et lignes vides sont ignorés.
+    Aliases en minuscules (hosts est insensible à la casse)."""
+    out: List[Dict] = []
+    for i, raw in enumerate((content or "").splitlines()):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 2:
+            continue
+        out.append({"idx": i, "ip": parts[0], "raw": raw,
+                    "aliases": [a.lower() for a in parts[1:]]})
+    return out
+
+
+def hosts_audit(content: str, expected: Dict[str, str]) -> Dict:
+    """Écart attendu/réel d'un /etc/hosts. `expected` : {nom court du
+    nœud → IP de gestion}. Retour : {ok, missing, wrong, shortless,
+    dup, stale} — missing/wrong/dup portent sur les nœuds du cluster,
+    stale sur les entrées de la famille sans nœud correspondant.
+    Fonction PURE (aucun I/O) : l'audit dry-run et la maquette de test
+    l'appellent directement."""
+    entries = _hosts_entries(content)
+    by_alias: Dict[str, List[Dict]] = {}
+    for e in entries:
+        for a in e["aliases"]:
+            by_alias.setdefault(a, []).append(e)
+    known = {str(n).lower(): ip for n, ip in (expected or {}).items()}
+    missing: List[Dict] = []
+    wrong: List[Dict] = []
+    shortless: List[Dict] = []
+    dup: List[Dict] = []
+    ok: List[str] = []
+    for name, ip in sorted(known.items()):
+        lines = by_alias.get(name, [])
+        if not lines:
+            # alias court absent : une ligne ne porte-t-elle que le FQDN ?
+            fqdn_lines = [e for e in entries
+                          if any(a.split(".")[0] == name
+                                 for a in e["aliases"])]
+            if fqdn_lines:
+                good = [e for e in fqdn_lines if e["ip"] == ip]
+                if good and len(fqdn_lines) == 1:
+                    shortless.append({"name": name, "ip": ip,
+                                      "found": fqdn_lines[0]["ip"],
+                                      "idx": fqdn_lines[0]["idx"]})
+                else:
+                    wrong.append({"name": name, "ip": ip,
+                                  "found": sorted({e["ip"]
+                                                   for e in fqdn_lines}),
+                                  "idx": fqdn_lines[-1]["idx"],
+                                  "also_fqdn_only": True})
+            else:
+                missing.append({"name": name, "ip": ip})
+            continue
+        good = [e for e in lines if e["ip"] == ip]
+        if good:
+            ok.append(name)
+            if len(lines) > 1:
+                dup.append({"name": name, "ip": ip,
+                            "kept_idx": good[-1]["idx"],
+                            "stale_idx": [e["idx"] for e in lines
+                                          if e["idx"] != good[-1]["idx"]]})
+        else:
+            wrong.append({"name": name, "ip": ip,
+                          "found": sorted({e["ip"] for e in lines}),
+                          "idx": lines[-1]["idx"]})
+    # entrées OBSOLÈTES : famille des nœuds actuels, alias court en
+    # « préfixe + numéro », mais aucun nœud actuel ne porte ce nom.
+    prefs = hosts_family_prefixes(expected or {})
+    stale: List[Dict] = []
+    seen_lines: Set[int] = set()
+    for e in entries:
+        for a in e["aliases"]:
+            short = a.split(".")[0]
+            if short in known:
+                break
+            if any(re.fullmatch(re.escape(p) + r"\d+", short) for p in prefs):
+                stale.append({"alias": short, "ip": e["ip"], "idx": e["idx"],
+                              "raw": e["raw"]})
+                seen_lines.add(e["idx"])
+                break
+    return {"ok": sorted(ok), "missing": missing, "wrong": wrong,
+            "shortless": shortless, "dup": dup, "stale": stale}
+
+
+def hosts_fix(content: str, expected: Dict[str, str],
+              fqdns: Optional[Dict[str, str]] = None
+              ) -> Tuple[str, List[str]]:
+    """Applique les corrections dictées par hosts_audit sur le CONTENU
+    (fonction pure — l'écriture du fichier revient à l'appelant) :
+    retour (nouveau_contenu, actions_lisibles). Les lignes retirées sont
+    mises en commentaire daté, JAMAIS effacées."""
+    fqdns = fqdns or {}
+    lines = (content or "").splitlines()
+    touched: Set[int] = set()
+    actions: List[str] = []
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    marker = f"# [proxmox-rolling-update {stamp}]"
+
+    def comment_out(i: int, why: str) -> None:
+        lines[i] = f"{marker} {why} : {lines[i]}"
+        touched.add(i)
+
+    # 1) nœuds du cluster
+    audit = hosts_audit(content, expected)
+    for m in audit["missing"]:
+        fqdn = (fqdns.get(m["name"]) or "").strip()
+        entry = (f"{m['ip']}\t{fqdn}\t{m['name']}" if fqdn
+                 else f"{m['ip']}\t{m['name']}")
+        lines.append(entry)
+        actions.append(f"MANQUANT → ligne ajoutée : {entry.replace(chr(9), '  ')}")
+    for s in audit["shortless"]:
+        i = s["idx"]
+        if i in touched:
+            continue
+        lines[i] = f"{lines[i]} {s['name']}"
+        touched.add(i)
+        actions.append(f"ALIAS COURT ABSENT → « {s['name']} » ajouté à la ligne de {s['ip']}")
+    for w in audit["wrong"]:
+        i = w["idx"]
+        if i not in touched:
+            lines[i] = re.sub(r"^\S+", w["ip"], lines[i], count=1)
+            touched.add(i)
+            actions.append(
+                f"INCOHÉRENT → « {w['name']} » : IP corrigée "
+                f"({', '.join(w['found'])} → {w['ip']})")
+    for d in audit["dup"]:
+        for j in d["stale_idx"]:
+            comment_out(j, f"doublon de « {d['name']} » ({d['ip']})")
+            actions.append(f"DOUBLON → ligne de « {d['name']} » mise en commentaire (IP conservée : {d['ip']})")
+    # 2) entrées obsolètes de la famille (hors lignes déjà corrigées)
+    for s in audit["stale"]:
+        if s["idx"] in touched:
+            continue
+        comment_out(s["idx"], f"« {s['alias']} » n'est pas/plus un nœud du cluster")
+        actions.append(
+            f"OBSOLÈTE → « {s['alias']} » ({s['ip']}) mis en commentaire : "
+            "nœud absent du cluster, retirez la ligne définitivement "
+            "si vous confirmez")
+    return "\n".join(lines) + ("\n" if content.endswith("\n") else ""), actions
+
+
+def hosts_item_str(it: Dict, kind: str) -> str:
+    """Ligne de rapport lisible pour une anomalie d'audit."""
+    if kind == "missing":
+        return f"MANQUANT : {it['name']} ({it['ip']})"
+    if kind == "wrong":
+        return (f"INCOHÉRENT : {it['name']} → pointe "
+                f"{', '.join(it['found'])}, attendu {it['ip']}"
+                + (" (alias court absent, ligne FQDN seulement)"
+                   if it.get("also_fqdn_only") else ""))
+    if kind == "shortless":
+        return (f"INCOHÉRENT : {it['name']} — ligne FQDN sans alias court "
+                f"(getent ne résout pas le nom court), IP {it['found']}")
+    if kind == "dup":
+        return (f"DOUBLON : « {it['name']} » sur "
+                f"{1 + len(it['stale_idx'])} ligne(s)")
+    if kind == "stale":
+        return (f"EN TROP : « {it['alias']} » ({it['ip']}) — ressemble à un "
+                "nœud de ce cluster mais n'en fait pas partie (retiré du "
+                "cluster ?)")
+    return str(it)
 
 
 # ---------------------------------------------------------------------------
@@ -2161,6 +2376,44 @@ class ProxmoxClient:
                                "(type non supporté ou passphrase incorrecte).")
         self._ssh_pkey = pkey
         return self._ssh_pkey
+
+    def hosts_read(self, node: str) -> str:
+        """Contenu brut de /etc/hosts du nœud (lecture pure)."""
+        return self._ssh(node, "cat /etc/hosts")
+
+    def hosts_fqdn(self, node: str) -> Optional[str]:
+        """FQDN du nœud (« hostname -f »), None si injoignable/sans
+        domaine — best-effort, jamais bloquant."""
+        try:
+            out = self._ssh(node, "hostname -f 2>/dev/null").strip()
+        except Exception:
+            return None
+        if not out:
+            return None
+        fq = out.split()[0]
+        return fq if "." in fq else None
+
+    def hosts_write(self, node: str, new_content: str) -> str:
+        """Écrit /etc/hosts du nœud : sauvegarde datée PUIS écriture
+        atomique de contenu encodé en base64 (zéro interprétation par
+        le shell distante — aucun échappement à casser). Retourne le
+        chemin de la sauvegarde. Lève RuntimeError au moindre échec."""
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        bak = f"/etc/hosts.proxmox-rolling-update.bak-{ts}"
+        b64 = base64.b64encode(new_content.encode("utf-8")).decode("ascii")
+        cmd = (f"cp -a /etc/hosts {bak} && "
+               f"echo '{b64}' | base64 -d > /etc/hosts && "
+               f"chmod --reference={bak} /etc/hosts")
+        self._ssh(node, cmd)
+        # relecture immédiate : ce qui est SUR LE DISQUE doit être ce
+        # que l'on a voulu écrire, sinon la correction est réputée ÉCHUE.
+        back = self.hosts_read(node)
+        if back != new_content:
+            raise RuntimeError(
+                f"{node}: /etc/hosts réécrit mais la relecture diffère "
+                f"(réseau ? système de fichiers plein ?) — RESTAUREZ "
+                f"depuis {bak} avant de relancer.")
+        return bak
 
     def _ssh(self, node: str, cmd: str, stream: bool = False,
              retries: Optional[int] = None) -> str:
@@ -5595,6 +5848,134 @@ class Updater:
         sous un autre identifiant entre-temps."""
         self._ha_rule_definition_restore(rid, entry.get("rule") or {})
 
+    def hosts_sync(self) -> None:
+        """ÉTAPE 0-bis : /etc/hosts de CHAQUE nœud doit résoudre tous
+        les nœuds du cluster par nom court (corosync, migrations, ceph,
+        SSH inter-nœuds). Audit complet en lecture AVANT de toucher au
+        premier nœud — en dry-run : rapport SEULEMENT (aucune
+        modification) ; en --execute : correction par nœud (ajout des
+        manquants, IP incohérentes, doublons et entrées obsolètes mises
+        en commentaire) après sauvegarde datée, puis re-vérification.
+        Désactivable via PVE_HOSTS_CHECK=0 (audit refusé si un nœud ne
+        peut pas être corrigé : un /etc/hosts faux en pleine migration
+        peut casser la résolution de noms au pire moment)."""
+        if str(_env("PVE_HOSTS_CHECK", "1")) != "1":
+            self.log.info("/etc/hosts : audit désactivé (PVE_HOSTS_CHECK=0).")
+            return
+        banner(self.log,
+               "ÉTAPE 0-bis — /etc/hosts : résolution de tous les nœuds "
+               "du cluster", ColorFormatter.CYAN)
+        expected: Dict[str, str] = {}
+        for name, ni in sorted(self.state.nodes.items()):
+            ip = self.client.node_addr.get(name)
+            if not ip or ip == name:
+                self.log.warning(
+                    f"  {name} : IP de gestion inconnue (API) — "
+                    "l'entrée /etc/hosts ne sera pas vérifiée/corrigée "
+                    "pour ce nœud.")
+                continue
+            expected[name] = ip
+        contents: Dict[str, str] = {}
+        for name in expected:
+            try:
+                contents[name] = self.client.hosts_read(name)
+            except Exception as e:
+                self.log.warning(
+                    f"  {name} : /etc/hosts illisible ({e}) — audit "
+                    "non bloquant pour CE nœud, poursuivi pour les autres.")
+        # FQDN de référence (format « IP  FQDN  nom ») : d'abord ceux déjà
+        # présents dans les fichiers du cluster, sinon « hostname -f » —
+        # seulement si un MANQUANT est à quelque part (lecture pure).
+        fqdns: Dict[str, str] = {}
+        need_fqdn = {m["name"] for c in contents.values()
+                     for m in hosts_audit(c, expected)["missing"]}
+        for name in need_fqdn:
+            for c in contents.values():
+                for e in _hosts_entries(c):
+                    if name in e["aliases"]:
+                        dotted = [a for a in e["aliases"]
+                                  if "." in a and a.split(".")[0] == name]
+                        if dotted:
+                            fqdns[name] = dotted[0]
+                            break
+                if name in fqdns:
+                    break
+            if name not in fqdns:
+                fq = self.client.hosts_fqdn(name)
+                if fq:
+                    fqdns[name] = fq
+                else:
+                    self.log.info(
+                        f"  {name} : FQDN introuvable — l'entrée ajoutée "
+                        "sera au format « IP nom ».")
+        fixed = 0
+        dirty_nodes = 0
+        for name in sorted(contents):
+            node_expected = expected
+            audit = hosts_audit(contents[name], node_expected)
+            n_pb = (len(audit["missing"]) + len(audit["wrong"])
+                    + len(audit["shortless"]) + len(audit["dup"])
+                    + len(audit["stale"]))
+            if not n_pb:
+                self.log.info(f"  {name} : /etc/hosts complet "
+                              f"({len(expected)}/{len(expected)} nœuds "
+                              "résolus, aucune entrée obsolète) ✔")
+                continue
+            dirty_nodes += 1
+            self.log.warning(f"  {name} : {n_pb} correction(s) nécessaire(s)")
+            for kind in ("missing", "wrong", "shortless", "dup", "stale"):
+                for it in audit[kind]:
+                    self.log.warning(f"      {hosts_item_str(it, kind)}")
+            if self.dry:
+                self.log.info(
+                    f"      [DRY-RUN] aucune correction appliquée sur "
+                    f"{name} — le fichier serait réécrit (sauvegarde "
+                    "datée puis ajout/correction/commentaire).")
+                continue
+            new_content, actions = hosts_fix(contents[name], node_expected,
+                                              fqdns)
+            try:
+                bak = self.client.hosts_write(name, new_content)
+            except Exception as e:
+                raise RuntimeError(
+                    f"{name}: correction de /etc/hosts IMPOSSIBLE ({e}) "
+                    "— abandon AVANT toute migration : un fichier "
+                    "incohérent peut casser la résolution de noms en "
+                    "plein run.")
+            fixed += 1
+            for a in actions:
+                self.log.info(f"      ✔ {a}")
+            self.log.info(f"      /etc/hosts de {name} corrigé — "
+                          f"sauvegarde : {bak}")
+            # re-vérification : le correctif doit avoir TOUT réglé.
+            after = hosts_audit(self.client.hosts_read(name), node_expected)
+            n_after = (len(after["missing"]) + len(after["wrong"])
+                       + len(after["shortless"]) + len(after["dup"])
+                       + len(after["stale"]))
+            if n_after:
+                raise RuntimeError(
+                    f"{name}: /etc/hosts corrigé mais l'audit re-détecte "
+                    f"{n_after} anomalie(s) — abandon (état du fichier : "
+                    "voir ci-dessus, sauvegarde disponible).")
+        if self.dry:
+            if dirty_nodes:
+                self.log.warning(
+                    f"/etc/hosts : {dirty_nodes} nœud(s) à corriger — "
+                    "rejouez ce dry-run après les corrections ou passez "
+                    "en --execute.")
+            else:
+                self.log.info(
+                    f"/etc/hosts : conforme sur les {len(contents)} "
+                    "nœud(s) audités ✔")
+        elif dirty_nodes:
+            self.log.info(
+                f"/etc/hosts : {fixed} nœud(s) corrigés "
+                f"(sur {len(contents)} audités) ✔")
+        elif contents:
+            self.log.info(
+                f"/etc/hosts : conforme sur les {len(contents)} "
+                "nœud(s) audités ✔")
+
     def update_node(self, node: str, progress: str = ""):
         state = self.state
         ip = self.client.node_addr.get(node, "?")
@@ -7164,6 +7545,11 @@ class Updater:
                     raise RuntimeError(f"Nœud '{only_node}' introuvable.")
             self.only_node = bool(only_node)
             self.preflight()
+            # ÉTAPE 0-bis (v15) : /etc/hosts de chaque nœud doit résoudre
+            # tous les pairs AVANT la première évacuation. Lecture pure
+            # en dry-run (rapport des manquants/en trop), correction
+            # sauvegardée en --execute.
+            self.hosts_sync()
             # fichier d'état : trace ce qu'il faudra restaurer si ce run
             # plante (ressources HA détachées, nœuds en maintenance).
             # Mis à jour à CHAQUE transition, supprimé en fin de run OK.
