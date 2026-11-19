@@ -52,6 +52,22 @@ VMs restent en place. Les MAJ Debian contiennent souvent des correctifs
 de sécurité : elles ne sont pas supprimées, seulement DIFFÉRÉES —
 repasser un run SANS l'option dans une autre fenêtre pour les appliquer.
 
+Garde-fou onboot + disques locaux (v20) : une VM stopped avec onboot=1
+était TOUJOURS migrée (laissée sur place, elle partirait au boot du nœud
+au retour d'upgrade — vécu 19/11 : VM 405, disques sur un storage NON
+PARTAGÉ inexistant sur les autres nœuds, 2 tentatives de migration
+vouées d'avance, chacune déclenchant un carrousel complet des 13 hôtes
+API sur une erreur 500 pourtant DÉTERMINISTE, puis FATAL). Désormais :
+sur stockage partagé → migration comme avant ; disques LOCAUX (ou
+storages illisibles) → laissée sur place avec 'onboot' TEMPORAIREMENT
+suspendu (PUT de config avec digest), restauré en fin de traitement du
+nœud et TRACÉ dans le fichier d'état (la reprise d'un run interrompu le
+restaure). L'erreur « storage … is not available on node … » est
+classée déterministe : plus aucun carrousel d'hôte API. Si ni la
+migration ni la suspension ne sont possibles : arrêt AVANT évacuation
+(remédiation manuelle), jamais rebooter un nœud qui ferait démarrer une
+VM contre toute intention.
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
@@ -65,7 +81,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "19"
+SCRIPT_VERSION = "20"
 
 import argparse
 import base64
@@ -2424,6 +2440,23 @@ class ProxmoxClient:
                     self.log.debug(f"Objet introuvable ({msg}) — erreur "
                                    f"déterministe, aucune bascule d'hôte.")
                     raise
+                if "is not available on node" in msg:
+                    # storage (ou autre objet) ABSENT de la CIBLE de la
+                    # requête (vécu 19/11 : 500 « storage 'shm1…21local'
+                    # is not available on node 'p-shm1-proxspv-18' » :
+                    # disques LOCAUX d'une VM stopped, le planner avait
+                    # proposé une cible qui ne porte pas le storage du
+                    # disque). Erreur DÉTERMINISTE : la requête est
+                    # validée cluster-wide (pmxcfs), tous les hôtes
+                    # échoueraient À L'IDENTIQUE — sans ce cas, chaque
+                    # tentative déclenchait un carrousel complet des
+                    # hôtes API (vécu : 2 carrousels de 13 hôtes ≈ 54 s
+                    # de bruit, plus le faux message pveproxy).
+                    self.log.error(
+                        f"Storage/objet indisponible sur la CIBLE ({msg}) "
+                        f"— requête refusée cluster-wide : erreur "
+                        f"déterministe, aucune bascule d'hôte.")
+                    raise
                 if "proxy handshake" in msg or " 595" in msg \
                         or "595 Errors during connection" in msg:
                     # appel PROXIFIÉ vers le nœud cible : c'est la CIBLE
@@ -4274,6 +4307,35 @@ class ProxmoxClient:
         self._vm_onboot[key] = res
         return res
 
+    def vm_set_onboot(self, node: str, vmid: int, vmtype: str,
+                      value: bool) -> None:
+        """Positionne l'option « onboot » (start at boot) d'un guest
+        (garde-fou v20). Relecture AVANT écriture + PUT avec le DIGEST
+        de la config lue : une modif concurrentine fait ÉCHOUER le PUT
+        au lieu d'être écrasée silencieusement. Utilisé pour suspendre
+        TEMPORAIREMENT l'auto-démarrage d'une VM stopped+onboot=1 dont
+        les disques LOCAUX l'ancrent à son nœud (migration impossible :
+        storage non partagé inexistant ailleurs — la laisser démar-
+        rerait au boot du nœud au retour d'upgrade, puis une ressource
+        HA 'stopped' l'éteindrait). La valeur d'origine est restaurée
+        dans le finally du nœud ET tracée dans le fichier d'état
+        (reprise après interruption)."""
+        cfg = (self.with_api(
+                   lambda p: p.nodes(node).lxc(vmid).config.get())
+               if vmtype == "lxc" else
+               self.with_api(
+                   lambda p: p.nodes(node).qemu(vmid).config.get()))
+        params: Dict[str, object] = {"onboot": 1 if value else 0}
+        digest = (cfg or {}).get("digest")
+        if digest:
+            params["digest"] = digest
+        if vmtype == "lxc":
+            self.with_api(lambda p: p.nodes(node).lxc(vmid)
+                          .config.put(**params))
+        else:
+            self.with_api(lambda p: p.nodes(node).qemu(vmid)
+                          .config.put(**params))
+
     def migrate_vm(self, node: str, vmid: int, target: str, vmtype: str,
                    timeout: Optional[int] = None):
         """Migration d'un guest. QEMU : live migration (zéro downtime).
@@ -4946,6 +5008,12 @@ class Updater:
         # en attente) — ni évacuation ni upgrade ni reboot pour eux.
         self.skip_minor: bool = False
         self.minor_skipped: List[str] = []
+        # Garde-fou onboot v20 : guests stopped+onboot=1 ancrés à leur
+        # nœud par des disques LOCAUX — laissés sur place avec onboot
+        # temporairement suspendu (restauré au finally du nœud et
+        # TRACÉ dans le fichier d'état : la reprise après crash le
+        # refera). Clé « vmtype:vmid ».
+        self.onboot_suspended: Dict[str, Dict] = {}
         self._off_rule_deferred_logged: Set[str] = set()
         # vmid des ressources HA repliées hors règle puis RAPATRIÉES sur
         # un nœud de leur règle pendant le rééquilibrage final (gel CRM) :
@@ -5016,13 +5084,15 @@ class Updater:
                         "maintenance": old.get("maintenance") or [],
                         "ha_ignored": old.get("ha_ignored") or {},
                         "ha_rules": merged,
-                        "ceph_flags": old.get("ceph_flags") or {}}
+                        "ceph_flags": old.get("ceph_flags") or {},
+                        "onboot_suspended": old.get("onboot_suspended") or {}}
             else:
                 data = {"updated": datetime.now().isoformat(timespec="seconds"),
                         "maintenance": self.maintenance_nodes,
                         "ha_ignored": self.ha_snapshot,
                         "ha_rules": self.ha_rules_snapshot,
-                        "ceph_flags": self.ceph_flags}
+                        "ceph_flags": self.ceph_flags,
+                        "onboot_suspended": self.onboot_suspended}
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=1)
         except Exception as e:
@@ -5052,7 +5122,8 @@ class Updater:
         if (not rules
                 and not data.get("ha_ignored")
                 and not data.get("maintenance")
-                and not data.get("ceph_flags")):
+                and not data.get("ceph_flags")
+                and not data.get("onboot_suspended")):
             self._state_clear()
             return
         data["ha_rules"] = rules
@@ -5095,7 +5166,8 @@ class Updater:
         maint = data.get("maintenance", [])
         flags = data.get("ceph_flags", {})
         rules = data.get("ha_rules", {})
-        if not res and not maint and not flags and not rules:
+        onbs = data.get("onboot_suspended", {})
+        if not res and not maint and not flags and not rules and not onbs:
             # Fichier résiduel SANS rien à récupérer : run interrompu
             # (ex. Ctrl-C) APRÈS restauration complète de l'état zéro —
             # typiquement pendant la fenêtre de stabilité CRM de fin.
@@ -5127,6 +5199,10 @@ class Updater:
             self.log.info(f"Règles node-affinity laissées désactivées/"
                           f"détachées ({len(rules)}) : "
                           f"{', '.join(sorted(rules))}")
+        if onbs:
+            self.log.info(f"Guests avec 'onboot' suspendu (garde-fou "
+                          f"disques locaux, à restaurer) "
+                          f"({len(onbs)}) : {', '.join(sorted(onbs))}")
         if self.dry:
             # Règles node-affinity : réactivées POUR DE VRAI même en
             # dry-run — c'est la même action réversible que la
@@ -5158,6 +5234,11 @@ class Updater:
                           "'ignored', nœuds en maintenance, flags Ceph) : "
                           "AUCUNE action en dry-run — relancez en mode "
                           "--execute pour la remise à l'état zéro.")
+            if onbs:
+                self.log.info(
+                    "[SIMULATION] Guests avec 'onboot' suspendu : leur "
+                    "restauration (PUT de config) ne se fait qu'en "
+                    "--execute — relancez en mode --execute.")
             return
         # Règles d'affinité D'ABORD : le CRM applique la préférence dès
         # la réactivation des ressources qui suit (failback attendu).
@@ -5219,15 +5300,36 @@ class Updater:
                                    f"retrait MANUEL requis : "
                                    f"« ceph osd unset <flag> » (sans retrait, "
                                    f"un OSD mort ne serait pas remplacé).")
+        # Guests avec onboot suspendu (garde-fou v20 disques locaux) :
+        # restaurer la valeur d'origine AVANT tout le reste du run — un
+        # onboot resté à 0 ferait rater SILENCIEUSEMENT le boot du
+        # guest au prochain reboot de son nœud. Même logique que les
+        # ressources HA : l'échec d'une entrée n'empêche pas les
+        # autres ; le message indique la vérification manuelle.
+        for key, ent in sorted(onbs.items()):
+            ent = ent or {}
+            try:
+                self.client.vm_set_onboot(
+                    ent.get("node"), int(ent.get("vmid", 0)),
+                    ent.get("vmtype", "qemu"),
+                    bool(int(ent.get("onboot", 1))))
+                self.log.info(f"  {key} : 'onboot' restauré à "
+                              f"{int(ent.get('onboot', 1))} ✔")
+            except Exception as e:
+                self.log.error(f"  {key} : restauration de 'onboot' "
+                               f"IMPOSSIBLE ({e}) — vérifiez MANUELLEMENT "
+                               f"la config du guest (sinon il ne "
+                               f"démarrera pas au prochain boot du "
+                               f"nœud).")
         # l'état zéro est restauré : le fichier ne doit plus servir
         self._state_clear()
         # touched uniquement si la récupération a MODIFIÉ le cluster :
         # un fichier d'état vide (run précédent arrêté avant toute
         # écriture) ne justifie pas la fenêtre de stabilité de 60s
         # en fin de run.
-        if res or maint or rules:
+        if res or maint or rules or onbs:
             self.touched = True
-        if res or maint or rules:
+        if res or maint or rules or onbs:
             try:
                 self.client.wait_ha_settled()
             except Exception as e:
@@ -5616,11 +5718,69 @@ class Updater:
                     f"si elle démarrait au boot du nœud).")
                 continue
             if onboot:
+                loc = self.client.vm_on_local_storage(node, v.vmid,
+                                                     v.vmtype)
+                if loc is False:
+                    self.log.warning(
+                        f"  {v} : stopped avec onboot=1 — MIGRÉE (laissée "
+                        f"sur place, elle partirait au boot du nœud au "
+                        f"retour d'upgrade, puis le CRM l'éteindrait à la "
+                        f"réactivation de sa ressource 'stopped').")
+                    continue
+                # loc True (≥1 disque sur storage NON PARTAGÉ) ou None
+                # (storages/config illisibles — conservateur) : la
+                # migration devrait COPIER ses disques locaux vers des
+                # storages qui n'existent QUE sur ce nœud — PVE refuse
+                # l'appel cluster-wide (« storage '…' is not available
+                # on node '…' »), quelle que soit la cible (vécu
+                # 19/11 : VM 405, 2 tentatives FATA sur migration
+                # vouée d'avance). On la laisse donc SUR PLACE et on
+                # suspend TEMPORAIREMENT son onboot : elle ne
+                # partira pas au boot du nœud, et la valeur d'origine
+                # est restaurée au finally du nœud (fichier d'état en
+                # couvre une interruption).
+                if self.dry:
+                    self.log.info(
+                        f"  {v} : [SIMULATION] stopped avec onboot=1 et "
+                        f"disques LOCAUX (ou storages indéterminés) : "
+                        f"SERAIT laissée sur place avec onboot "
+                        f"temporairement désactivé puis restauré (ses "
+                        f"disques l'ancrent à {node}) — au lieu d'être "
+                        f"migrée vers un nœud qui ne porte pas son "
+                        f"storage.")
+                    leave.append(v)
+                    continue
+                try:
+                    self.client.vm_set_onboot(node, v.vmid, v.vmtype,
+                                              False)
+                except Exception as e:
+                    # Impossible de suspendre l'auto-démarrage ET
+                    # impossible de migrer (disques locaux) : rebooter
+                    # le nœud ferait DÉMARRER cette VM contre toute
+                    # intention (incident historique à l'origine du
+                    # garde-fou). Arrêt AVANT l'évacuation du nœud,
+                    # remédiation manuelle explicite.
+                    raise RuntimeError(
+                        f"{v} : stopped avec onboot=1, disques locaux "
+                        f"(migration impossible) et option 'onboot' "
+                        f"INMODIFIABLE ({e}) — abandon du nœud AVANT "
+                        f"évacuation : un reboot le ferait démarrer "
+                        f"contre toute intention. Suspendez-la à la "
+                        f"main (qm set {v.vmid} --onboot 0) puis "
+                        f"relancez (elle sera réactivée ensuite).")
+                key = f"{v.vmtype}:{v.vmid}"
+                self.onboot_suspended[key] = {
+                    "vmid": v.vmid, "vmtype": v.vmtype, "node": node,
+                    "onboot": 1}
+                self._state_write()
                 self.log.warning(
-                    f"  {v} : stopped avec onboot=1 — MIGRÉE (laissée "
-                    f"sur place, elle partirait au boot du nœud au "
-                    f"retour d'upgrade, puis le CRM l'éteindrait à la "
-                    f"réactivation de sa ressource 'stopped').")
+                    f"  {v} : stopped avec onboot=1 mais disques LOCAUX "
+                    f"(storage non partagé inexistant sur les autres "
+                    f"nœuds : migration vouée à l'échec) — LAISSÉE sur "
+                    f"place avec 'onboot' TEMPORAIREMENT désactivé "
+                    f"(restauré en fin de traitement du nœud ; tracé "
+                    f"dans le fichier d'état en cas d'interruption).")
+                leave.append(v)
                 continue
             leave.append(v)
         return leave
@@ -7047,6 +7207,31 @@ class Updater:
             elif not self.ha_snapshot:
                 self.log.info(f"{node}: aucune ressource HA n'a été "
                               f"détachée sur ce nœud — rien à réactiver.")
+            # 2g-ter) ONBOOT SUSPENDUS (garde-fou v20) : restaurer la
+            # valeur d'origine des guests stopped à disques LOCAUX
+            # laissés sur place sur CE nœud. Toujours tenté (même sur
+            # incident) : un onboot resté à 0 ferait silencieusement
+            # rater le boot du guest au prochain reboot — en cas d'échec
+            # l'entrée RESTE dans le fichier d'état, le prochain run la
+            # restaurera (même mécanisme que les ressources HA).
+            for key, ent in list(self.onboot_suspended.items()):
+                if ent.get("node") != node:
+                    continue        # guest d'un AUTRE nœud : pas ici
+                try:
+                    self.client.vm_set_onboot(
+                        node, int(ent["vmid"]), ent.get("vmtype", "qemu"),
+                        bool(int(ent.get("onboot", 1))))
+                    del self.onboot_suspended[key]
+                    self._state_write()
+                    self.log.info(f"  {key} : 'onboot' restauré à "
+                                  f"{int(ent.get('onboot', 1))} ✔")
+                except Exception as e:
+                    self.log.error(
+                        f"  {key} : restauration de 'onboot' IMPOSSIBLE "
+                        f"({e}) — l'entrée reste dans le fichier d'état, "
+                        f"le prochain run la restaurera. Sans elle, le "
+                        f"guest ne démarrera PAS au prochain boot du "
+                        f"nœud.")
 
     def restore_vms(self, node: str):
         """Mode --node : rapatrie sur le nœud traité les VMs qui ont été

@@ -452,7 +452,18 @@ fin de fichier), et la comparaison avant/après écriture est normalisée
   churn. Garde-fou : une VM arrêtée avec `onboot: 1` (ou de config
   illisible) reste **migrée** comme avant — laissée sur place, elle
   partirait au boot du nœud (plus gérée par le HA en `ignored`), puis le
-  CRM l'éteindrait à la réactivation de sa ressource.
+  CRM l'éteindrait à la réactivation de sa ressource. **Exception v20 —
+  disques locaux** : si ses disques sont sur un storage NON partagé
+  (inexistant sur les autres nœuds), la migration est vouée à l'échec
+  (PVE refuse cluster-wide « storage … is not available on node … »,
+  vécu : VM 405, 2 tentatives FATA) : la VM est alors **laissée sur
+  place** avec `onboot` **temporairement désactivé** (PUT de config avec
+  digest), restauré en fin de traitement du nœud et **tracé dans le
+  fichier d'état** — la reprise d'un run interrompu le restaure. Si ni
+  la migration ni la suspension ne sont possibles : arrêt AVANT
+  évacuation (un reboot ne doit jamais démarrer une VM contre toute
+  intention). L'erreur 500 « is not available on node » est par
+  ailleurs classée **déterministe** : aucun carrousel d'hôtes API.
 - `apt full-upgrade` en streaming dans les logs ; si noyau nouveau :
   re-contrôle Ceph, **flags de maintenance Ceph** (si Ceph), reboot,
   attente du retour (uptime réinitialisé, max 15 min).
