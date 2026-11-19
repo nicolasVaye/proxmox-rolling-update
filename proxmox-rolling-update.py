@@ -68,6 +68,18 @@ migration ni la suspension ne sont possibles : arrêt AVANT évacuation
 (remédiation manuelle), jamais rebooter un nœud qui ferait démarrer une
 VM contre toute intention.
 
+Correctif v21 : le cache des storages partagés (_shared_storages_cache)
+n'était JAMAIS initialisé dans le constructeur du client — le premier
+appel à shared_storages() levait AttributeError. En dry-run l'exception
+était silencieusement avalée (invocations protégées) : tous les guests
+étaient classés « disques locaux : indéterminé ». En EXÉCUTION, la
+porte v20 sur les VMs stopped onboot=1 (vécu 19/11, VM 405) la laissait
+remonter : FATAL « 'ProxmoxClient' object has no attribute
+'_shared_storages_cache' » AVANT toute migration, à la première VM
+stopped du nœud. Correctif : initialisation du dict dans __init__ (et
+audit AST complet : aucun autre attribut de données lu sans
+initialisation).
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
@@ -81,7 +93,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "20"
+SCRIPT_VERSION = "21"
 
 import argparse
 import base64
@@ -2213,6 +2225,14 @@ class ProxmoxClient:
         # NON partagé, mémoïsée par (vmtype, vmid) -> True/False/None.
         self._vm_local_disks: Dict[Tuple[str, int], Optional[bool]] = {}
         self._vm_onboot: Dict[Tuple[str, int], Optional[bool]] = {}
+        # Storages PARTAGÉS par nœud, mémoïsés (partagé = tout sauf local).
+        # NB v21 : cette initialisation manquait depuis l'introduction de
+        # la mémoïsation — shared_storages() levait AttributeError au
+        # PREMIER appel (vécu 19/11 : FATAL 'ProxmoxClient' object has no
+        # attribute '_shared_storages_cache' en Phase 1 sur la VM 405 ;
+        # en dry-run l'exception était avalée et tous les guests passaient
+        # en « disques locaux : indéterminé », dégradation silencieuse).
+        self._shared_storages_cache: Dict[str, Optional[Set[str]]] = {}
         self._connect_api()
         # Découverte dynamique de tous les nœuds du cluster
         if not API_HOSTS:
