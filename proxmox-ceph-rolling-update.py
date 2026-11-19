@@ -114,6 +114,44 @@ Usage :
 NB : --node n'est supporté qu'en mode mineur (le mode majeur exige de
 traiter TOUS les nœuds avant les redémarrages, et --rotate-keys est
 une procédure cluster-wide).
+
+HISTORIQUE :
+- v4 (2026-11-19) : Phase F lisible FS PAR FS. Le plan affiche la
+  carte « FS=MDS active » (ex. [cephfs=mds.a01, …]), chaque ligne de
+  restart d'active et chaque gate NOMMENT le FS (« MDS active X
+  (nœud, fs cephfs) : tourne en squid — redémarrage… », « Ceph
+  stable après « restart MDS active X (nœud, fs cephfs) » »).
+  Nouvelle lecture pure « fs_active_map » (fs dump), tolérante :
+  carte illisible → lignes sans nom de FS, jamais d'abort. Et les
+  lignes « tourne en X — arrêt/redémarrage » apparaissent AUSSI en
+  dry-run (lecture réelle de la version courante : mêmes repères
+  qu'en réel ; seuls la note, les durées d'arrêt et la vérification
+  du pool restent spécifiques au mode réel, où elles ont un sens).
+- v3 (2026-11-19) : Phase F lisibile jusqu'au BOUT, après incident vécu
+  du même jour : la standby mds.p-proxpra-a01--01 a IGNORÉ le SIGTERM
+  pendant 90 s (« State 'stop-sigterm' timed out. Killing » — systemd
+  SIGKILL ; standby sans rank, SANS conséquence, mais 90 s de blocage
+  SSH muet + UI PVE montrait des MDS « arrêtées qui ne redémarrent
+  pas » → interventions manuelles inutiles). Trois ajouts : (1) note
+  AVANT les arrêts — les standbys sont VOLONTAIREMENT maintenues
+  arrêtées jusqu'au passage des actives (procédure wiki, pas un bug) ;
+  (2) durée de chaque arrêt de standby loggée, seuil 30 s → warning
+  explicite (TimeoutStopSec/Systemd-SIGKILL, sans consequence) ;
+  (3) APRÈS les relances, vérification que chaque standby relancée
+  est bien DE RETOUR dans le pool (« ceph fs dump ») — la preuve
+  visuelle que les MDS reviennent, warning seul sans abort si timeout.
+- v2 (2026-11-19) : Phase F (MDS) verbeuse en exécution RÉELLE. Vécu
+  cluster PRA : 3 min 15 s de « trou muet » entre « Ranks réduits »
+  et la Phase G — 27 daemons arrêtés/relancés SANS une seule ligne de
+  log (les commandes mutantes réelles ne loggent qu'en debug). Désor-
+  mais : réglages lus par FS (« ceph fs get » : max_mds / standby_
+  replay), version COURANTE de chaque daemon avant action (« tourne
+  en squid — arrêt (relancée après les actives)… »), une ligne par
+  standby arrêtée/relancée et par active redémarrée, une ligne de
+  restauration par réglage temporaire, et un BILAN chiffré de la
+  phase. Ajout de SCRIPT_VERSION (affiché dans le bandeau de départ).
+  La logique de la procédure elle-même est inchangée.
+- v1 : version initiale.
 """
 
 import argparse
@@ -127,6 +165,10 @@ import sys
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
+
+# Version du script (v4 : Phase F lisible FS par FS — cf.
+# HISTORIQUE ci-dessus).
+SCRIPT_VERSION = "4"
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION — à adapter à votre plateforme
@@ -1562,6 +1604,31 @@ class ProxmoxClient:
             if name and name not in standbys:
                 standbys.append(name)
         return actives, standbys, up_ranks
+
+    def fs_active_map(self) -> Dict[str, str]:
+        """{nom du FS → nom de sa MDS ACTIVE} via « ceph fs dump -f
+        json » — même décodage tolérant que fs_dump_actives, dont
+        c'est le complément (v4 de la Phase F : NOMMER le FS de
+        chaque active dans le plan, les lignes de restart et les
+        gates — la lisibilité « FS par FS » exigée par l'ops).
+        Lecture pure, dry-run OK."""
+        out = self.ceph_run("ceph fs dump -f json")
+        data = self._json_lenient(out)
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Sortie non-JSON de « ceph fs dump » : "
+                               f"{out.strip()[:200]}")
+        mapping: Dict[str, str] = {}
+        for fs in data.get("filesystems") or []:
+            fsname = str(fs.get("name") or "")
+            mdsmap = fs.get("mdsmap") or fs
+            info = mdsmap.get("info") or {}
+            for _rank, gid in (mdsmap.get("up") or {}).items():
+                ent = info.get(str(gid)) or {}
+                name = str(ent.get("name", "")).replace("mds.", "")
+                if fsname and name:
+                    mapping[fsname] = name
+                    break
+        return mapping
 
     # ---------- Gates de stabilisation ----------
     def wait_ceph_stable(self, action: str,
@@ -3032,10 +3099,22 @@ class CephUpdater:
             asr = "true" if re.search(r"allow_standby_replay\s+true",
                                       out) else "false"
             orig[fs] = (max_mds, asr)
+            # v2 : le réglage lu est AFFICHÉ (muet en v1) — 14 FS =
+            # 14 lignes, mais le lecteur du log SAIT enfin ce que la
+            # phase lit et change.
+            self.log.info(f"{fs} : réglages MDS lus — max_mds={max_mds}, "
+                          f"allow_standby_replay={asr}")
             if asr == "true":
+                if not self.dry:
+                    self.log.info(f"{fs} : standby_replay off "
+                                  f"(temporaire) — EXÉCUTION…")
                 self._mut(f"ceph fs set {fs} allow_standby_replay false",
                           desc=f"{fs} : standby_replay off (temporaire)")
             if max_mds > 1:
+                if not self.dry:
+                    self.log.info(f"{fs} : réduction max_mds {max_mds} → 1 "
+                                  f"(temporaire) — les ranks en trop se "
+                                  f"désactivent…")
                 self._mut(f"ceph fs set {fs} max_mds 1",
                           desc=f"{fs} : max_mds 1 (temporaire, "
                                f"origine {max_mds})")
@@ -3078,8 +3157,9 @@ class CephUpdater:
                     raise RuntimeError("Les ranks MDS ne se désactivent "
                                        "pas — « ceph fs dump » pour "
                                        "diagnostiquer.")
-                self.log.warning("Attente de la désactivation des ranks "
-                                 "MDS supplémentaires…")
+                self.log.warning(f"Attente de la désactivation des ranks "
+                                 f"MDS supplémentaires "
+                                 f"({int(time.time() - t0)}s)…")
                 time.sleep(CEPH_POLL_S)
         daemon_node: Dict[str, str] = {}
         for node in mds_nodes:
@@ -3102,7 +3182,35 @@ class CephUpdater:
         #    restart des actives EN DERNIER, retour des standbys.
         standby_daemons = [(d, daemon_node[d]) for d in sorted(daemon_node)
                            if d not in active_names]
+        # v4 : association active → FS (lecture « ceph fs dump »),
+        # pour NOMMER le FS de chaque active dans le plan, les lignes
+        # de restart et les gates — lisibilité « FS par FS ». FS non
+        # mappé → tag absent, format générique ; jamais d'abort pour
+        # un nom manquant.
+        fs_of_active: Dict[str, str] = {}
+        try:
+            for _fs, _daemon in self.client.fs_active_map().items():
+                fs_of_active[_daemon] = _fs
+        except Exception as exc:
+            self.log.warning(
+                f"Carte FS → MDS active illisible ({exc}) — lignes de la "
+                f"Phase F sans nom de FS.")
+        pairs = ", ".join(f"{fs_of_active.get(a, '?')}={a}"
+                         for a in active_names)
         mds_skipped: Set[str] = set()
+        stb_started: Set[str] = set()
+        # v2 : annonce du plan d'action AVANT de commencer (en modes
+        # réel ET simulé) — l'ancienne version ne révélait rien avant
+        # la première gate d'active.
+        self.log.info(f"Phase F — plan : {len(active_names)} MDS active(s) "
+                      f"(1 par FS, à redémarrer EN DERNIER) "
+                      f"[{pairs}], "
+                      f"{len(standby_daemons)} standby(s) à arrêter puis "
+                      f"relancer, {len(daemon_node)} daemon(s) réparti(s) "
+                      f"sur {len(mds_nodes)} nœud(s).")
+        # v3 : la note « standbys volontairement arrêtées » est loggée
+        # dans la boucle ci-dessous, au PREMIER arrêt réel seulement.
+        stb_note_shown = False
         for name, node in standby_daemons:
             # Idempotence de reprise (même logique que mons/mgrs/OSDs) :
             # une standby qui TOURNE déjà sur la cible n'a plus rien
@@ -3110,7 +3218,7 @@ class CephUpdater:
             # APRÈS le retour des standbys, redémarrées pour rien).
             # Lecture illisible (daemon down) → stop/start quand même
             # (échec sûr : le start la ramène).
-            ver, _r = self.client.tell_running_version("mds", name)
+            ver, vrel = self.client.tell_running_version("mds", name)
             if ver == num:
                 self.log.info(f"MDS standby {name} ({node}) tourne déjà "
                               f"en {rel} — rien à faire.")
@@ -3122,20 +3230,61 @@ class CephUpdater:
                     f"ILLISIBLE (« ceph tell » ET « ceph mds metadata ») "
                     f"— stop/start quand même (échec sûr : le start la "
                     f"ramène).")
+            else:
+                # v4 : la ligne d'action EST en dry-run aussi (lecture
+                # pure réelle de la version) — simulation fidèle, mêmes
+                # repères qu'en réel.
+                self.log.info(f"MDS standby {name} ({node}) : tourne en "
+                              f"{vrel} — arrêt (relancée après le passage "
+                              f"des actives)…")
+            if not self.dry and not stb_note_shown:
+                stb_note_shown = True
+                # v3 : l'UX du run — entre l'arrêt des standbys et leur
+                # relance (APRÈS le passage des actives), l'UI PVE
+                # montre des MDS « éteintes qui ne redémarrent pas »
+                # (vécu : interventions GUI manuelles inutiles en
+                # pleine phase). C'est la PROCÉDURE : jamais de
+                # failover vers une standby pendant l'upgrade.
+                self.log.info(
+                    "Note : les standbys restent VOLONTAIREMENT "
+                    "arrêtées jusqu'à ce que TOUTES les actives aient "
+                    "redémarré (procédure wiki) ; elles sont relancées "
+                    "en fin de phase et leur retour dans le pool sera "
+                    "vérifié — ce n'est PAS un blocage.")
+            t_stop = time.time()
             self._mut(f"systemctl stop ceph-mds@{name}", node=node,
                       desc=f"arrêt de la MDS standby {name} ({node})")
             self.counts["restarts"] += 1
             self._est(EST_RESTART_MDS_S)
+            # v3 : durée de l'arrêt — un SIGTERM ignoré par le daemon
+            # bloque le stop jusqu'au TimeoutStopSec de systemd (défaut
+            # 90 s) puis SIGKILL (vécu : --01, 90 s pile). Standby sans
+            # rank : SANS conséquence, mais il faut le VOIR.
+            if not self.dry:
+                dur = time.time() - t_stop
+                if dur >= 30:
+                    self.log.warning(
+                        f"MDS standby {name} ({node}) : arrêt EFFECTIF en "
+                        f"{dur:.0f} s — SIGTERM probablement ignoré "
+                        f"jusqu'au TimeoutStopSec de systemd (SIGKILL ; "
+                        f"standby sans rank : SANS conséquence, la "
+                        f"relance la ramènera).")
+                else:
+                    self.log.info(f"MDS standby {name} ({node}) : arrêt "
+                                  f"effectif en {dur:.0f} s.")
+        act_restarted = 0
+        act_skipped = 0
         for name in active_names:
             if name not in daemon_node:
                 continue    # signalé plus haut (dry uniquement)
             node = daemon_node[name]
             # Idem pour l'active : déjà sur la cible → skip (elle a
             # déjà été redémarrée EN DERNIER par un run précédent).
-            ver, _r = self.client.tell_running_version("mds", name)
+            ver, vrel = self.client.tell_running_version("mds", name)
             if ver == num:
                 self.log.info(f"MDS active {name} ({node}) tourne déjà "
                               f"en {rel} — rien à faire.")
+                act_skipped += 1
                 continue
             if ver == 0:
                 self.log.warning(
@@ -3143,32 +3292,102 @@ class CephUpdater:
                     f"ILLISIBLE (« ceph tell » ET « ceph mds metadata ») "
                     f"— restart quand même (échec sûr : elle repart sur "
                     f"les nouveaux binaires).")
+            else:
+                # v4 : FS nommé + ligne visible AUSSI en dry-run.
+                fsname = fs_of_active.get(name)
+                fs_tag = f", fs {fsname}" if fsname else ""
+                self.log.info(f"MDS active {name} ({node}{fs_tag}) : "
+                              f"tourne en {vrel} — redémarrage (la "
+                              f"DERNIÈRE à tourner sur {rel})…")
             self._mut(f"systemctl restart ceph-mds@{name}", node=node,
                       desc=f"redémarrage de la MDS active {name} — la "
                            f"dernière à tourner sur {rel}")
             self.counts["restarts"] += 1
+            act_restarted += 1
             self._est(EST_RESTART_MDS_S)
-            self._gate(f"restart MDS active {name} ({node})")
+            # v4 : la gate NOMME le FS (dry comme réel).
+            fsname = fs_of_active.get(name)
+            fs_tag = f", fs {fsname}" if fsname else ""
+            self._gate(f"restart MDS active {name} "
+                       f"({node}{fs_tag})")
         if self.dry and not active_names:
             # simulation fidèle même sans actif lisible : l'étape du
             # restart de l'actif (le DERNIER, wiki) doit apparaître.
             self._sim(f"redémarrage du MDS actif — le DERNIER à tourner "
                       f"sur {rel} (noms réels lus via « ceph fs dump »)")
             self.counts["restarts"] += 1
+            act_restarted += 1
             self._est(EST_RESTART_MDS_S)
         for name, node in standby_daemons:
             if name in mds_skipped:
                 continue    # jamais arrêtée : déjà en cible, rien à faire
+            if not self.dry:
+                self.log.info(f"MDS standby {name} ({node}) : relance "
+                              f"(start) — retour au pool standby…")
             self._mut(f"systemctl start ceph-mds@{name}", node=node,
                       desc=f"retour de la MDS standby {name} ({node})")
+            stb_started.add(name)
+        # v3 : PREUVE que les standbys relancées sont bien de retour —
+        # « ceph fs dump » les liste (actives ou standbys) dès leur
+        # enregistrement auprès du mon. Warning seul sans abort : les
+        # rangs actifs sont servis, c'est la profondeur du pool qui
+        # est en cause, l'exploitant le voit et le script le dit.
+        if not self.dry and stb_started:
+            t0 = time.time()
+            while True:
+                try:
+                    acts, stbs, _up = self.client.fs_dump_actives()
+                    known = set(acts) | set(stbs)
+                except Exception as exc:
+                    self.log.warning(
+                        f"Retour du pool standby illisible ({exc}) — "
+                        f"vérification annulée (« ceph fs status » pour "
+                        f"voir).")
+                    break
+                missing = stb_started - known
+                if not missing:
+                    self.log.info(
+                        f"MDS : {len(stb_started)} standby(s) relancée(s) "
+                        f"toutes de retour dans le pool "
+                        f"(« ceph fs dump », {time.time() - t0:.0f} s) ✔")
+                    break
+                if time.time() - t0 > CEPH_STABLE_TIMEOUT:
+                    self.log.warning(
+                        f"MDS absentes du pool standby après "
+                        f"{CEPH_STABLE_TIMEOUT} s : "
+                        f"{', '.join(sorted(missing))} — ce n'est PAS un "
+                        f"abort (les rangs actifs sont servis) : "
+                        f"« ceph fs status » / journalctl -u ceph-mds@… "
+                        f"pour voir ce qui bloque leur enregistrement.")
+                    break
+                self.log.warning(
+                    f"Attente du retour dans le pool standby : "
+                    f"{', '.join(sorted(missing))}…")
+                time.sleep(CEPH_POLL_S)
         # 5) restauration des réglages d'origine
         for fs, (max_mds, asr) in orig.items():
             if max_mds > 1:
+                if not self.dry:
+                    self.log.info(f"{fs} : restauration max_mds={max_mds} "
+                                  f"— les ranks supplémentaires se "
+                                  f"réactivent…")
                 self._mut(f"ceph fs set {fs} max_mds {max_mds}",
                           desc=f"{fs} : restauration max_mds {max_mds}")
             if asr == "true":
+                if not self.dry:
+                    self.log.info(f"{fs} : restauration "
+                                  f"allow_standby_replay=true…")
                 self._mut(f"ceph fs set {fs} allow_standby_replay true",
                           desc=f"{fs} : restauration standby_replay")
+        # v2 : bilan chiffré de la phase (l'ancienne version passait
+        # de « Ranks réduits » à la Phase G SANS aucun résumé).
+        stb_handled = len(standby_daemons) - len(mds_skipped)
+        self.log.info(f"Phase F — bilan : {stb_handled} standby(s) "
+                      f"arrêtée(s) puis relancée(s), {act_restarted} "
+                      f"MDS active(s) redémarrée(s) (EN DERNIER), "
+                      f"{len(mds_skipped) + act_skipped} déjà en {rel} "
+                      f"(rien à faire), {len(fs_list)} FS — réglages "
+                      f"max_mds/standby_replay restaurés.")
 
     # ---------------- Action 3 : rotation des clés (CVE-2025-30156) ----
     def _backup_keyring(self, bdir: str, name: str,
@@ -4427,7 +4646,7 @@ def main():
     else:
         action_name = "minor"
     dry = args.dry_run
-    banner(logger, f"PROXMOX CEPH ROLLING UPDATE — mode "
+    banner(logger, f"PROXMOX CEPH ROLLING UPDATE v{SCRIPT_VERSION} — mode "
                    f"{'DRY-RUN (simulation)' if dry else 'EXÉCUTION RÉELLE'}"
                    f" — action : {action_name}",
            ColorFormatter.GREEN if dry else "\033[91;1m")

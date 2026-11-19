@@ -153,7 +153,34 @@ Deux scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
   arrêtées unité par unité, actives redémarrées en dernier — jamais de
   stop/start de `ceph-mds.target` ; une MDS dont la version courante
   est déjà la cible (standby ou active) est SAUTÉE, rendant la Phase F
-  idempotente à la reprise. Et `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
+  idempotente à la reprise. La Phase F est aussi **verbeuse en
+  exécution réelle** (v2 du script Ceph) : chaque FS affiche ses
+  réglages lus (`max_mds`/`standby_replay`) et leurs changements
+  temporaires, chaque MDS affiche sa version COURANTE avant action
+  (« tourne en squid — arrêt (relancée après les actives)… »),
+  chaque arrêt/restart/start de daemon logge une ligne (les commandes
+  mutantes réelles ne loggent qu'en debug — vécu : 3 min 15 s de trou
+  muet sur 27 MDS, 40 opérations invisibles), et la phase se ferme
+  sur un **bilan chiffré** (standbys arrêtées/relancées, actives
+  redémarrées, skips). La v3 verrouille la lisibilité jusqu'au bout :
+  une **note au premier arrêt réel** rappelle que les standbys restent
+  VOLONTAIREMENT arrêtées jusqu'au passage des actives (vécu :
+  intervention GUI manuelle inutile pendant que l'UI PVE montre des
+  MDS « qui ne redémarrent pas » — c'est la procédure wiki, pas un
+  bug), la **durée de chaque arrêt** est loggée — un SIGTERM ignoré
+  par le daemon bloque jusqu'au `TimeoutStopSec` de systemd (90 s,
+  SIGKILL ; standby sans rank, sans conséquence — vécu : `--01`,
+  90 s pile de blocage muet), et **après les relances, le retour de
+  chaque standby dans le pool est vérifié** (`ceph fs dump`) avec
+  warning seul si timeout (jamais d'abort : les rangs actifs sont
+  servis). La v4 rend la phase lisible **FS par FS** : le plan
+  affiche la carte `FS=MDS active` (`[cephfs=mds.a01, …]`), chaque
+  ligne de restart d'active et chaque gate NOMMENT le FS
+  (`MDS active X (nœud, fs cephfs) : tourne en squid —
+  redémarrage…`), carte lue par `fs dump`, tolérante (illisible →
+  lignes sans nom de FS, jamais d'abort) ; les lignes « tourne en X »
+  apparaissent AUSSI en dry-run (lectures réelles : mêmes repères
+  qu'en réel). Et `--rotate-keys` (remédiation CVE-2025-30156, entités déjà migrées
   re-détectées et sautées) : ses vérifications « check AUTH_INSECURE_*
   disparu » (étapes 7/8/9/12) sont POLLÉES jusqu'à
   `PVE_CEPH_ROTATE_CHECK_TIMEOUT_S` (défaut 120 s) — le health check
