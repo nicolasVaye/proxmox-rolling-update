@@ -446,6 +446,12 @@ fin de fichier), et la comparaison avant/après écriture est normalisée
   affinités respectées), puis migrations réelles, en respectant les marges
   de sécurité RAM (AUTO : `min(max(10 % × RAM, 8 G), 48 G, 30 % × RAM)`)
   et 80 % de CPU.
+- **Version PVE par nœud dans le log (v23)** : comme les infos noyau
+  (`noyau courant=…, dernier installé=…`), chaque nœud affiche sa version
+  pve-manager en Phase 0 (`{node}: version PVE=9.2.26`) et à nouveau
+  après son traitement (`(après traitement du nœud)`) — un rolling
+  upgrade qui touche les paquets `pve-*`/`proxmox-*` se lit directement
+  dans le log, nœud après nœud, avant/après.
 - **VMs arrêtées : laissées sur place** (aucune migration) — une VM éteinte
   ne court aucun risque pendant l'upgrade et le reboot ; sa ressource HA
   reste détachée puis réactivée dans son état d'origine (`stopped`), sans

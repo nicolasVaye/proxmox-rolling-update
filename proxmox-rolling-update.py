@@ -97,6 +97,12 @@ réarment pas (déjà un signe de souci) ; garde-fou dur : plafond TOTAL
 PVE_HA_SETTLE_MAX_TOTAL (défaut 4 h) au-delà duquel seul le FATAL
 « cluster instable » est justifié.
 
+Version PVE par nœud dans le log de l'Étape 1 (v23) : la version
+pve-manager de chaque nœud est affichée en Phase 0 (comme les infos
+noyau : « p-shm1-proxspv-18: version PVE=9.2.26 ») et à nouveau après
+le traitement du nœud (preuve directe de la montée de version quand
+les paquets pve-*/proxmox-* étaient dans la liste apt).
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
@@ -110,7 +116,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "22"
+SCRIPT_VERSION = "23"
 
 import argparse
 import base64
@@ -3190,6 +3196,21 @@ class ProxmoxClient:
             except Exception as e:
                 out[name] = f"inaccessible ({e})"
         return out
+
+    def pve_version(self, node: str) -> str:
+        """Version PVE (pve-manager) d'UN nœud (ex. « 9.2.26 ») :
+        GET /nodes/{node}/version, champ « version » (v23). Affichée
+        pour CHAQUE nœud dans le déroulé de l'Étape 1, comme les infos
+        noyau (« noyau courant=…, dernier installé=… ») : un rolling
+        upgrade qui touche les paquets pve-* se lit alors directement
+        dans le log, nœud après nœud. NON mémoïsée : la valeur change
+        précisément à l'upgrade du nœud — elle est donc relue APRÈS
+        son traitement, preuve directe de la montée de version."""
+        try:
+            v = self.with_api(lambda p: p.nodes(node).version.get())
+            return str((v or {}).get("version", "?"))
+        except Exception as e:
+            return f"inaccessible ({e})"
 
     def _ha_maintenance(self, node: str, new_cmd: str, old_cmd: str):
         """Commande de maintenance HA, compatible PVE 8 et PVE 9 :
@@ -6700,6 +6721,12 @@ class Updater:
                               f"{gb(avail)} libres / {gb(total)} "
                               f"({avail / max(total, 1):.0%} libre)")
 
+        # --- DIAGNOSTIC VERSION PVE (v23) : comme les infos noyau, pour
+        # CHAQUE nœud traité — un changement de version pve-* se lit
+        # directement dans le log de l'Étape 1 (lecture pure, dry-run
+        # inclus ; la version APRÈS traitement est affichée en 2f).
+        self.log.info(f"{node}: version PVE={self.client.pve_version(node)}")
+
         reboot_only = False
         if n_up == 0:
             # REBOOT EN ATTENTE même sans paquets : cas d'un run précédent
@@ -7215,6 +7242,12 @@ class Updater:
             # 2f) vérifications post-reboot
             if not self.client.post_boot_checks(node):
                 raise RuntimeError(f"Les vérifications post-reboot de {node} ont échoué.")
+            # v23 : version PVE APRÈS traitement du nœud — preuve
+            # directe de la montée de pve-manager (ou constat que le
+            # nœud était déjà à jour), en miroir de la ligne Phase 0.
+            self.log.info(f"{node}: version PVE="
+                          f"{self.client.pve_version(node)} "
+                          f"(après traitement du nœud)")
             # statistiques : séquence reboot complète (reboot → retour
             # en ligne → quorum → post-checks), uniquement si un reboot
             # a VRAIMENT eu lieu sur ce nœud pendant ce run.
