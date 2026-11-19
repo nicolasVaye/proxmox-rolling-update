@@ -30,10 +30,33 @@ nœud et par run, réutilisée pour toutes les commandes, recréée si morte —
 y compris après le reboot du nœud) ; retentatives PVE_SSH_RETRIES
 (défaut 3) avec délais progressifs 15/30/45 s.
 
+Reprise sur échec de migration (v18) : une live migration peut échouer
+APRÈS un transfert complet, sur une course QEMU au « resume » du tunnel
+(« tunnel replied 'ERR: resume failed - VM n not running' », vécu
+18/11/2026 sur la VM 374 : transfert 3.2 GiB OK, downtime 94 ms, VM
+retrouvée ARRÊTÉE sur le nœud cible et run entier interrompu). Le script
+diagnostique alors où vit réellement la VM, la REDEMARRE si elle a été
+assassinée par la course (sur la cible si ses disques y sont déjà, sinon
+sur sa source), et retente la migration (PVE_MIGRATE_ATTEMPTS tentatives
+au total, défaut 2). Le FATAL ne survient qu'après épuisement — plus
+jamais une VM éteinte sans avoir tenté de la relancer.
+
+Option --skip-minor-updates (v19) : reprise rapide après incident. Un run
+complet dure ~5 h ; si Debian publie des MAJ mineures PENDANT ce run, la
+relance refait chaque nœud déjà traité (évacuation complète ~25 min pour
+quelques paquets sans importance). Avec l'option, un nœud dont les seules
+MAJ en attente sont des paquets Debian mineurs (PAS de noyau, PAS de
+paquet pve-*/proxmox-* = changement de version PVE, PAS de reboot en
+attente) est IGNORÉ ce run : ni évacuation ni upgrade ni reboot — les
+VMs restent en place. Les MAJ Debian contiennent souvent des correctifs
+de sécurité : elles ne sont pas supprimées, seulement DIFFÉRÉES —
+repasser un run SANS l'option dans une autre fenêtre pour les appliquer.
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
     python3 proxmox_rolling_update.py --execute --node pve-node3   # un seul nœud
+    python3 proxmox_rolling_update.py --execute --skip-minor-updates  # reprise rapide
 """
 
 # ---------------------------------------------------------------------------
@@ -42,7 +65,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "15"
+SCRIPT_VERSION = "19"
 
 import argparse
 import base64
@@ -163,6 +186,19 @@ MIGRATE_TIMEOUT = int(_env("PVE_MIGRATE_TIMEOUT", "600"))
 MIGRATE_TIMEOUT_MAX = 3600      # plafond du timeout adapté (garde-fou)
 MIGRATE_TIMEOUT_FACTOR = 2.0    # marge : timeout = max(plancher, FACTEUR ×
                                 # durée estimée par le modèle de débit)
+MIGRATE_ATTEMPTS = int(_env("PVE_MIGRATE_ATTEMPTS", "2"))
+                                # REPRISE v18 sur échec de migration :
+                                # nombre TOTAL de tentatives d'une même
+                                # migration quand la première échoue sur
+                                # un échec TRANSITOIRE (course QEMU au
+                                # « resume » du tunnel, cf.
+                                # _migrate_resilient). 1 = comportement
+                                # v17 (échec → FATAL immédiat).
+START_TIMEOUT = int(_env("PVE_START_TIMEOUT", "300"))
+                                # attente max (s) du démarrage d'un
+                                # guest (qm/pct start) pendant la reprise
+                                # v18 — un guest 192G met du temps à
+                                # redémarrer, 300s couvre large.
 CEPH_TIMEOUT = 900              # secondes max d'attente d'un Ceph HEALTH_OK
 REBOOT_TIMEOUT = 900            # secondes max d'attente du retour d'un nœud
 
@@ -1138,6 +1174,68 @@ def hosts_audit(content: str, expected: Dict[str, str]) -> Dict:
             "shortless": shortless, "dup": dup, "stale": stale}
 
 
+def hosts_block_sort(lines: List[str],
+                    expected: Dict[str, str]) -> List[str]:
+    """Réordonne les lignes du /etc/hosts CORRIGÉ en BLOCS canoniques
+    (v17) : les ajouts de nœuds manquants atterrissaient en FIN de
+    fichier, APRÈS la section IPv6 — le fichier corrigé perdait sa
+    structure d'origine. Ordre imposé à CHAQUE réécriture :
+      1. localhost / bouclage (127.0.0.1, ::1) ;
+      2. nœuds du cluster (ordre d'origine préservé, ajouts en fin de
+         bloc, ajouts triés par nom car sans ordre d'origine) ;
+      3. « le reste » (autres entrées : backup, autres clusters, VIP,
+         commentaires neutres — ordre d'origine préservé) ;
+      4. section IPv6 EN DERNIER si elle existe (bannière Debian
+         « ...IPv6 capable hosts », #::1..., entrées IPv6 actives) ;
+      5. tout à la fin, les lignes mises en commentaire PAR CE SCRIPT
+         (retraits datés) : elles ne sont pas du contenu de
+         résolution, un « cimetière » clairement séparé en fin de
+         fichier est plus simple à relire puis purger.
+    Les lignes vides d'origine sont remplacées par UNE ligne vide
+    entre blocs. Aucun contenu n'est modifié : uniquement déplacé.
+    Les fichiers déjà conformes ne sont PAS réécrits (hosts_sync
+    n'écrit que sur anomalie) — ce tri ne s'applique donc qu'aux
+    fichiers déjà en cours de correction."""
+    known = {str(n).lower() for n in (expected or {})}
+    fam = hosts_family_prefixes(expected or {})
+    lb: List[str] = []       # 1. localhost / bouclage
+    cl: List[str] = []       # 2. nœuds du cluster (+ retraits non marqués)
+    rest: List[str] = []     # 3. le reste (entrées + commentaires neutres)
+    v6: List[str] = []       # 4. section IPv6 (bannière + entrées, actives ou commentées)
+    graveyard: List[str] = []  # 5. retraits produits par ce script
+
+    def clusterish(ip: str, aliases: List[str]) -> bool:
+        if any(a in known for a in aliases):
+            return True
+        return any(re.fullmatch(re.escape(p) + r"\d+", a.split(".")[0])
+                   for p in fam for a in aliases)
+
+    for l in lines or []:
+        s = l.strip()
+        if not s:
+            continue                                    # séparateur régénéré
+        if s.startswith("#"):
+            if s.startswith("# [proxmox-rolling-update"):
+                graveyard.append(l.rstrip())            # retrait daté du script
+            elif re.search(r"(?i)ipv6|ip6-|::", s):
+                v6.append(l.rstrip())                   # bannière + #::1...
+            else:
+                rest.append(l.rstrip())                 # commentaire neutre
+            continue
+        parts = s.split()
+        ip, aliases = parts[0], [a.lower() for a in parts[1:]]
+        if re.match(r"^(127\.|0\.0\.0\.0|::1\b)", ip):
+            lb.append(l.rstrip())
+        elif clusterish(ip, aliases):
+            cl.append(l.rstrip())
+        elif ":" in ip:
+            v6.append(l.rstrip())
+        else:
+            rest.append(l.rstrip())
+    blocks = [b for b in (lb, cl, rest, v6, graveyard) if b]
+    return ("\n\n".join("\n".join(b) for b in blocks)).splitlines()
+
+
 def hosts_fix(content: str, expected: Dict[str, str],
               fqdns: Optional[Dict[str, str]] = None
               ) -> Tuple[str, List[str]]:
@@ -1192,7 +1290,49 @@ def hosts_fix(content: str, expected: Dict[str, str],
             f"OBSOLÈTE → « {s['alias']} » ({s['ip']}) mis en commentaire : "
             "nœud absent du cluster, retirez la ligne définitivement "
             "si vous confirmez")
+    # v17 : layout en blocs canoniques (localhost / cluster / reste /
+    # IPv6 en dernier / retraits du script tout à la fin) — pur, sans
+    # modification du contenu, uniquement l'ordre des lignes.
+    lines = hosts_block_sort(lines, expected)
     return "\n".join(lines) + ("\n" if content.endswith("\n") else ""), actions
+
+
+def hosts_write_files_identical(a: str, b: str) -> bool:
+    """Compare deux contenus de /etc/hosts de façon STABLE, symétrique
+    et indépendante du transport : toutes les commandes SSH de ce script
+    tournent avec get_pty=True, et un PTY ajoute un '\\r' à chaque fin
+    de ligne (translation ONLCR) — la relecture « cat » d'un fichier
+    écrit en '\\n' revient donc systématiquement en '\\r\\n'. Une
+    comparaison octet à octet échouait à TOUS les coups alors même que
+    le fichier sur disque était PARFAIT (vécu le 18/11 : FATAL « la
+    relecture diffère » sur p-c4-proxspv-10, correction sur disque
+    correcte). On compare donc ligne par ligne, SANS les '\\r'/espaces
+    de fin de ligne, en ignorant les lignes vides de queue (une
+    absence de saut de ligne final n'est pas une corruption)."""
+    def norm(s: str) -> List[str]:
+        lines = [l.rstrip("\r \t") for l in (s or "").splitlines()]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines
+    return norm(a) == norm(b)
+
+
+def hosts_write_files_diff_hint(back: str, new_content: str) -> str:
+    """Premières lignes divergentes (normalisées) pour le message
+    d'erreur — assez pour diagnostiquer sans noyer la log."""
+    def norm(s: str) -> List[str]:
+        lines = [l.rstrip("\r \t") for l in (s or "").splitlines()]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return lines
+    a, b = norm(back), norm(new_content)
+    for i in range(max(len(a), len(b))):
+        x = a[i] if i < len(a) else "<absente>"
+        y = b[i] if i < len(b) else "<absente>"
+        if x != y:
+            return (f"première divergence ligne {i + 1} : "
+                    f"disque « {x[:80]} » / attendu « {y[:80]} »")
+    return "aucune divergence normalisée (casse/blancs ?)"
 
 
 def hosts_item_str(it: Dict, kind: str) -> str:
@@ -2397,7 +2537,12 @@ class ProxmoxClient:
         """Écrit /etc/hosts du nœud : sauvegarde datée PUIS écriture
         atomique de contenu encodé en base64 (zéro interprétation par
         le shell distante — aucun échappement à casser). Retourne le
-        chemin de la sauvegarde. Lève RuntimeError au moindre échec."""
+        chemin de la sauvegarde. Lève RuntimeError au moindre échec.
+        NB : la relecture de vérification passe par le PTY SSH (get_pty)
+        qui renvoie CHAQUE fin de ligne en « \\r\\n » — la comparaison
+        est donc NORMALISÉE (hosts_write_files_identical, v16) : un
+        '\\r' de transport n'est PAS une divergence, un vrai contenu
+        différent l'est toujours (ligne à ligne)."""
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         bak = f"/etc/hosts.proxmox-rolling-update.bak-{ts}"
         b64 = base64.b64encode(new_content.encode("utf-8")).decode("ascii")
@@ -2408,11 +2553,14 @@ class ProxmoxClient:
         # relecture immédiate : ce qui est SUR LE DISQUE doit être ce
         # que l'on a voulu écrire, sinon la correction est réputée ÉCHUE.
         back = self.hosts_read(node)
-        if back != new_content:
+        if not hosts_write_files_identical(back, new_content):
             raise RuntimeError(
                 f"{node}: /etc/hosts réécrit mais la relecture diffère "
-                f"(réseau ? système de fichiers plein ?) — RESTAUREZ "
-                f"depuis {bak} avant de relancer.")
+                f"({hosts_write_files_diff_hint(back, new_content)} ; "
+                f"réseau ? système de fichiers plein ?) — VÉRIFIEZ le "
+                f"fichier AVANT toute action : s'il est correct, "
+                f"poursuivez (la sauvegarde {bak} reste disponible), "
+                f"s'il est cassé restaurez-la.")
         return bak
 
     def _ssh(self, node: str, cmd: str, stream: bool = False,
@@ -3991,6 +4139,37 @@ class ProxmoxClient:
                            f"illisible ({e}).")
             return False
 
+    def vm_status(self, node: str, vmid: int, vmtype: str = "qemu"
+                  ) -> Optional[Dict]:
+        """État d'un guest VU DE CE NŒUD, ou None si le guest n'y est PAS
+        (config absente sur ce nœud : l'API répond en erreur — c'est le
+        signe que le guest réside ailleurs). Diagnostic de LOCALISATION
+        après un échec de migration (reprise v18)."""
+        try:
+            return self.with_api(
+                lambda p: getattr(p.nodes(node), vmtype)(vmid)
+                .status.current.get())
+        except Exception:
+            return None
+
+    def vm_start(self, node: str, vmid: int, vmtype: str = "qemu",
+                 timeout: Optional[int] = None):
+        """Démarre un guest sur un nœud (tâche asynchrone attendue).
+        Reprise v18 : une VM arrêtée par une course QEMU au « resume »
+        de la migration doit repartir AU PLUS VITE — ses disques et sa
+        config sont DÉJÀ sur le nœud cible."""
+        if timeout is None:
+            # lu À L'APPEL (pas de défaut capturé à l'import : une valeur
+            # PVE_START_TIMEOUT du --env-file doit rester effective).
+            timeout = START_TIMEOUT
+        self.log.info(f"  Démarrage du "
+                      f"{'CT' if vmtype == 'lxc' else 'VM'} {vmid} sur "
+                      f"{node} (timeout {timeout}s)…")
+        task = self.with_api(
+            lambda p: getattr(p.nodes(node), vmtype)(vmid)
+            .status.start.post())
+        self._wait_task(node, task, timeout=timeout)
+
     def ha_maintenance_on(self, node: str):
         self.log.info(f"Activation du mode maintenance HA sur {node}")
         self._ha_maintenance(node, "enable", "on")
@@ -4228,19 +4407,24 @@ class ProxmoxClient:
                              f"poursuite.")
         self._ssh(node, "apt-get update -q")
 
-    def apt_upgrade_pending(self, node: str) -> Tuple[int, bool, int, int]:
+    def apt_upgrade_pending(self, node: str) -> Tuple[int, bool, int, int, bool]:
         """Évalue (sans rien installer) les mises à jour en attente :
         - simulation apt-get (mode -s, aucune action),
         - retour : (nb de paquets à mettre à jour, noyau concerné ?,
                     octets à télécharger, octets d'espace disque
-                    supplémentaire requis (négatif si libéré)).
-        Le noyau dans la liste => reboot attendu après le full-upgrade."""
+                    supplémentaire requis (négatif si libéré),
+                    paquet PVE concerné ? (pve-*/proxmox-*)).
+        Le noyau dans la liste => reboot attendu après le full-upgrade.
+        Un paquet pve-*/proxmox-* dans la liste => changement de version
+        PVE (pve-manager, pve-qemu-kvm, proxmox-kernel…) : significatif
+        pour --skip-minor-updates, qui n'ignore JAMAIS ces nœuds."""
         out = self._ssh(node, "DEBIAN_FRONTEND=noninteractive "
                               "apt-get -s full-upgrade -q")
         m = re.search(r"(\d+) upgraded", out)
         n = int(m.group(1)) if m else 0
         kernel = bool(re.search(r"^Inst (proxmox-kernel|linux-image)",
                                 out, re.M))
+        pve_up = bool(re.search(r"^Inst (pve-|proxmox-)", out, re.M))
 
         def _to_bytes(val: str, unit: str) -> int:
             mul = {"B": 1, "kB": 10**3, "MB": 10**6, "GB": 10**9}.get(unit, 1)
@@ -4263,7 +4447,7 @@ class ProxmoxClient:
             inst = _to_bytes(m.group(1), m.group(2))
             if "freed" in out[m.start():m.end()]:
                 inst = -inst
-        return n, kernel, dl, inst
+        return n, kernel, dl, inst, pve_up
 
     def disk_free(self, node: str) -> Dict[str, Tuple[int, int]]:
         """Diagnostic espace disque : {montage: (octets libres, octets
@@ -4756,6 +4940,12 @@ class Updater:
         # préférés, en pleine évacuation des nœuds suivants).
         self.off_rule_vmids: Set[int] = set()
         self.only_node: bool = False
+        # --skip-minor-updates (v19) : ignorer les nœuds dont les
+        # seules MAJ en attente sont des paquets Debian mineurs
+        # (aucun noyau, aucun paquet pve-*/proxmox-*, aucun reboot
+        # en attente) — ni évacuation ni upgrade ni reboot pour eux.
+        self.skip_minor: bool = False
+        self.minor_skipped: List[str] = []
         self._off_rule_deferred_logged: Set[str] = set()
         # vmid des ressources HA repliées hors règle puis RAPATRIÉES sur
         # un nœud de leur règle pendant le rééquilibrage final (gel CRM) :
@@ -5057,6 +5247,184 @@ class Updater:
         except Exception:
             return True
 
+    # ---------- LIVE MIGRATION RÉSILIENTE — REPRISE D'INCIDENT (v18) ------
+    def _migrate_recover(self, src: str, tgt: str, real: VmInfo,
+                         err: BaseException) -> str:
+        """Diagnostic de LOCALISATION post-échec, puis reprise (v18).
+        Retour :
+        - 'target' : la guest est VIVANTE (ou dans son état attendu)
+          sur la CIBLE — disques + config y sont, la migration est
+          ABOUTIE : le plan continue son cours ;
+        - 'retry'  : la guest est dans un état PROPRE sur sa SOURCE
+          (rollback complet côté Proxmox, éventuellement après
+          redémarrage de secours par le script) : la migration peut
+          être retentée.
+        Lève RuntimeError si la guest est arrêtée et IMPOSSIBLE à
+        relancer : là seulement, le FATAL est justifié."""
+        k = "CT" if real.vmtype == "lxc" else "VM"
+        # 1) la guest vit-elle déjà sur la cible ?
+        st_t = self.client.vm_status(tgt, real.vmid, real.vmtype)
+        if st_t is not None:
+            qmp = str(st_t.get("qmpstatus", st_t.get("status", "")))
+            if qmp == "running":
+                return "target"      # jamais réellement perdue
+            if qmp == "stopped":
+                if real.status != "running":
+                    return "target"  # stopped → stopped : attendu ✔
+                # course QEMU « resume » classique : la guest a été
+                # ASSASSINÉE en fin de migration, transfert pourtant
+                # complet — on la redémarre SUR LA CIBLE (un retour à
+                # la source obligerait à recopier tout ce qui a déjà
+                # été transféré, et l'évacuation doit aboutir).
+                self.log.warning(
+                    f"  {k} {real.vmid} : ARRÊTÉE sur {tgt} alors "
+                    f"qu'elle tournait avant (course QEMU au « resume », "
+                    f"transfert pourtant terminé) — REDÉMARRAGE sur la "
+                    f"cible : disques et config y sont déjà…")
+                self.client.vm_start(tgt, real.vmid, real.vmtype)
+                if not self.client.vm_alive(tgt, real.vmid, real.vmtype,
+                                            expect="running"):
+                    raise RuntimeError(
+                        f"{k} {real.vmid} redémarrée sur {tgt} mais "
+                        f"toujours injoignable")
+                return "target"
+            # statut transitoire (paused, utilisateur…) : attendre un
+            # peu et re-sonder une fois avant d'abandonner la reprise.
+            self.log.warning(f"  {k} {real.vmid} sur {tgt} : statut "
+                             f"'{qmp}' transitoire — nouvelle sonde "
+                             f"dans 15s…")
+            time.sleep(15)
+            st_t = self.client.vm_status(tgt, real.vmid, real.vmtype)
+            if st_t is not None:
+                qmp = str(st_t.get("qmpstatus", st_t.get("status", "")))
+                if qmp == "running":
+                    return "target"
+                if qmp == "stopped" and real.status != "running":
+                    return "target"
+                if qmp == "stopped":
+                    self.log.warning(
+                        f"  {k} {real.vmid} : ARRÊTÉE sur {tgt} après la "
+                        f"course QEMU — REDÉMARRAGE sur la cible…")
+                    self.client.vm_start(tgt, real.vmid, real.vmtype)
+                    if not self.client.vm_alive(tgt, real.vmid,
+                                                real.vmtype,
+                                                expect="running"):
+                        raise RuntimeError(
+                            f"{k} {real.vmid} redémarrée sur {tgt} "
+                            f"mais toujours injoignable")
+                    return "target"
+                raise RuntimeError(
+                    f"{k} {real.vmid} sur {tgt} : statut '{qmp}' ni "
+                    f"running ni stopped après re-sonde — reprise "
+                    f"impossible en sécurité")
+        # 2) la guest est-elle restée sur sa source (rollback complet) ?
+        st_s = self.client.vm_status(src, real.vmid, real.vmtype)
+        if st_s is not None:
+            qmp = str(st_s.get("qmpstatus", st_s.get("status", "")))
+            if qmp == "stopped" and real.status == "running":
+                # tuée pendant la migration et rollbackée : service à
+                # restaurer AVANT toute chose (le retry la re-migrera).
+                self.log.warning(
+                    f"  {k} {real.vmid} : ARRÊTÉE sur sa source {src} "
+                    f"(rollback de la migration) — REDÉMARRAGE sur la "
+                    f"source pour restaurer le service avant de "
+                    f"retenter…")
+                self.client.vm_start(src, real.vmid, real.vmtype)
+                if not self.client.vm_alive(src, real.vmid, real.vmtype,
+                                            expect="running"):
+                    raise RuntimeError(
+                        f"{k} {real.vmid} redémarrée sur {src} mais "
+                        f"toujours injoignable")
+            return "retry"
+        raise RuntimeError(
+            f"{k} {real.vmid} introuvable NI sur {src} NI sur {tgt} — "
+            f"état incohérent à examiner à la main")
+
+    def _migrate_resilient(self, src: str, tgt: str, real: VmInfo,
+                           timeout: Optional[int]) -> None:
+        """Migration d'un guest avec REPRISE D'INCIDENT (v18).
+        Contexte : un échec de tâche qmigrate n'est pas toujours un
+        échec de migration. Cas vécu 18/11/2026 (VM 374 → p-pes-
+        proxspv-18) : transfert COMPLETE (3.2 GiB, downtime 94 ms,
+        « migration status: completed ») mais le processus QEMU cible
+        est déjà mort au « resume » du tunnel → « ERR: resume failed -
+        VM 374 not running » → TASK ERROR « migration problems », VM
+        éteinte, run ENTIer abandonné en FATAL pour une course
+        transitoire (bug QEMU/PVE connu, souvent reproductible au
+        second essai — variante documentée : tâche OK mais VM revenue
+        arrêtée sur la cible).
+        v18 : après CHAQUE échec (tâche en erreur OU guest injoignable
+        post-tâche) → _migrate_recover localise la guest et la
+        relance (cible si ses disques y sont, source sinon), puis la
+        migration est retentée (PVE_MIGRATE_ATTEMPTS tentatives au
+        total). FATAL uniquement si la guest est irrécupérable ou
+        toutes les tentatives échouées — et JAMAIS sans avoir tenté
+        de réallumer la guest d'abord."""
+        k = "CT" if real.vmtype == "lxc" else "VM"
+        # lu À L'APPEL (une valeur du --env-file doit rester effective
+        # après la relecture de main(), cf. MIGRATE_TIMEOUT).
+        total = max(1, int(MIGRATE_ATTEMPTS))
+        last_err: Optional[BaseException] = None
+        for attempt in range(1, total + 1):
+            if attempt > 1:
+                self.log.warning(f"… {k} {real.vmid} : nouvelle tentative "
+                                 f"de migration {src} ➔ {tgt} "
+                                 f"(tentative {attempt}/{total})")
+                time.sleep(5)
+            try:
+                self.client.migrate_vm(src, real.vmid, tgt, real.vmtype,
+                                       timeout=timeout)
+                last_err = None
+            except Exception as e:
+                last_err = e
+                self.log.error(f"  Échec de la migration de {k} "
+                               f"{real.vmid} vers {tgt} "
+                               f"(tentative {attempt}/{total}) : {e}")
+            # diagnostic post-migration (acquis v13, intégré ici) : la
+            # guest a-t-elle VRAIMENT survécu au déplacement ? La
+            # variante « tâche OK mais guest revenue arrêtée » existe
+            # (forum Proxmox) : le contrôle vaut pour les DEUX issues.
+            if last_err is None and self.client.vm_alive(
+                    tgt, real.vmid, real.vmtype, expect=real.status):
+                return                      # succès franc
+            if last_err is None:
+                self.log.error(
+                    f"  {k} {real.vmid} : tâche de migration OK mais "
+                    f"guest injoignable sur {tgt} (running → stopped) "
+                    f"— reprise v18 appliquée.")
+                last_err = RuntimeError(
+                    f"{k} {real.vmid} injoignable après migration vers "
+                    f"{tgt}")
+            # reprise : localiser + relancer la guest
+            try:
+                how = self._migrate_recover(src, tgt, real, last_err)
+            except Exception as rec_err:
+                raise RuntimeError(
+                    f"{k} {real.vmid} : migration échouée ({last_err}) "
+                    f"ET reprise impossible ({rec_err}) — arrêt avant "
+                    f"d'aggraver la situation (fichier d'état "
+                    f"conservé).") from rec_err
+            if how == "target":
+                if self.client.vm_alive(tgt, real.vmid, real.vmtype,
+                                        expect=real.status):
+                    self.log.info(
+                        f"  ✔ {k} {real.vmid} : REPRISE RÉUSSIE — vivante "
+                        f"sur {tgt}, migration aboutie, le run continue.")
+                    return
+                if attempt >= total:
+                    raise RuntimeError(
+                        f"{k} {real.vmid} injoignable sur {tgt} après "
+                        f"reprise — arrêt avant d'aggraver la situation "
+                        f"(fichier d'état conservé).")
+                continue
+            # how == 'retry' : guest remise en état PROPRE sur sa
+            # source — on retente s'il reste des tentatives.
+        raise RuntimeError(
+            f"Migration de {k} {real.vmid} {src} ➔ {tgt} : {total} "
+            f"tentative(s) échouée(s) — dernière erreur : {last_err}. "
+            f"Arrêt avant d'aggraver la situation (fichier d'état "
+            f"conservé).")
+
     def _apply_migrations(self, plans: List[Dict], state: ClusterState,
                           migrate: bool = True, ha_live: bool = False):
         """Exécute (ou simule) les migrations du plan et met à jour l'état.
@@ -5088,19 +5456,12 @@ class Updater:
                     _mig_to = (None if (real.vmtype == "lxc"
                                         or real.status != "running")
                                else _migrate_timeout_for(vm_load(real)))
-                    self.client.migrate_vm(p["from"], real.vmid, tgt,
-                                          real.vmtype, timeout=_mig_to)
+                    # v18 : migration RÉSILIENTE — reprise + retry sur
+                    # échec transitoire (course QEMU « resume »), le
+                    # diagnostic post-migration (guest vivant ?) est
+                    # intégré à la boucle de reprise.
+                    self._migrate_resilient(p["from"], tgt, real, _mig_to)
                     self.touched = True
-                    # diagnostic post-migration : la VM a-t-elle survécu ?
-                    # (guest agent si présente, sinon qmpstatus/qemu ;
-                    # une VM stopped reste stopped : migration hors ligne)
-                    k = "CT" if real.vmtype == "lxc" else "VM"
-                    if not self.client.vm_alive(tgt, real.vmid, real.vmtype,
-                                                expect=real.status):
-                        raise RuntimeError(
-                            f"{k} {real.vmid} injoignable après migration "
-                            f"vers {tgt} — arrêt avant d'aggraver la "
-                            f"situation (fichier d'état conservé).")
                     # statistiques : une LIVE migration QEMU sur stockage
                     # PARTICIPATIF est un échantillon exploitable du
                     # modèle dur = ram/EST_MIGRATE_SPEED + overhead. Les
@@ -5995,7 +6356,8 @@ class Updater:
         # mais seul --execute doit alimenter les moyennes).
         _t_eval = time.time()
         self.client.apt_update(node)
-        n_up, kernel_up, dl_b, inst_b = self.client.apt_upgrade_pending(node)
+        n_up, kernel_up, dl_b, inst_b, pve_up = \
+            self.client.apt_upgrade_pending(node)
         if not self.dry:
             self.stats_new["apt_update_s"].append(
                 round(time.time() - _t_eval, 1))
@@ -6033,9 +6395,31 @@ class Updater:
                 f"/var/run/reboot-required — run précédent interrompu "
                 f"avant le reboot ?) — maintenance planifiée : évacuation "
                 f"puis reboot, SANS upgrade")
+        # --- PORTE --skip-minor-updates (v19) : un nœud dont les seules
+        # MAJ en attente sont des paquets Debian mineurs (aucun noyau, aucun
+        # paquet pve-*/proxmox-*, aucun reboot en attente) est IGNORÉ
+        # pour ce run : ni évacuation, ni upgrade, ni reboot. Cas
+        # d'usage : reprise après incident — Debian publie des MAJ
+        # mineures pendant un run de ~5 h, et chaque nœud déjà traité
+        # se verrait sinon infliger une évacuation complète (~25 min)
+        # pour quelques paquets sans importance.
+        if (self.skip_minor and n_up > 0 and not reboot_only
+                and not kernel_up and not pve_up
+                and not self.client.reboot_required(node)):
+            self.log.info(
+                f"{node}: --skip-minor-updates : {n_up} paquet(s) Debian en "
+                f"attente, mais AUCUN changement significatif (ni noyau, ni "
+                f"paquet pve-*/proxmox-*, ni reboot en attente) — nœud "
+                f"IGNORÉ : ni évacuation ni upgrade ni reboot. Les MAJ de "
+                f"ce nœud restent en attente : relancer un run SANS "
+                f"l'option pour les appliquer.")
+            self.minor_skipped.append(node)
+            return
         self.log.info(f"{node}: {n_up} paquet(s) à mettre à jour"
                       + (" — noyau inclus, reboot attendu après upgrade"
-                         if kernel_up else ""))
+                         if kernel_up else "")
+                      + (" — dont paquet(s) PVE (version pve-*/proxmox-*)"
+                         if pve_up else ""))
         if self.dry:
             # bilan : apt update + simulation — SEULEMENT si CE nœud va
             # vraiment en maintenance (paquets OU reboot en attente) ;
@@ -7522,7 +7906,7 @@ class Updater:
                           "conformes).")
 
     # ---------- point d'entrée ----------
-    def run(self, only_node: Optional[str]):
+    def run(self, only_node: Optional[str], skip_minor: bool = False):
         try:
             if not self.dry:
                 self.state = self.client.fetch_state()
@@ -7544,6 +7928,7 @@ class Updater:
                 if not nodes:
                     raise RuntimeError(f"Nœud '{only_node}' introuvable.")
             self.only_node = bool(only_node)
+            self.skip_minor = bool(skip_minor)
             self.preflight()
             # ÉTAPE 0-bis (v15) : /etc/hosts de chaque nœud doit résoudre
             # tous les pairs AVANT la première évacuation. Lecture pure
@@ -7557,6 +7942,18 @@ class Updater:
                 self._state_write()
             for idx, node in enumerate(nodes, 1):
                 self.update_node(node, f"{idx}/{len(nodes)}")
+            # Récap --skip-minor-updates (v19) : nœuds ignorés ce run
+            # (MAJ Debian mineures seules). Rappel EXPLICITE : ces MAJ
+            # (parfois des correctifs de sécurité) ne sont pas
+            # supprimées, seulement DIFFÉRÉES — relancer un run sans
+            # l'option dans une autre fenêtre pour les appliquer.
+            if self.minor_skipped:
+                self.log.info(
+                    f"--skip-minor-updates : {len(self.minor_skipped)} "
+                    f"nœud(s) ignoré(s) — MAJ Debian mineures uniquement : "
+                    f"{', '.join(self.minor_skipped)}. Les MAJ de ces nœuds "
+                    f"restent en attente : relancez un run SANS l'option "
+                    f"pour les appliquer.")
             # FIN de l'Étape 1 : réactivation des règles node-affinity
             # désactivées au premier nœud — AVANT le rapatriement
             # (--node) / le rééquilibrage et le plan de failback des
@@ -7670,6 +8067,18 @@ def main():
     mode.add_argument("--execute", action="store_true",
                       help="Exécution réelle.")
     parser.add_argument("--node", help="Ne traiter que ce nœud (optionnel).")
+    parser.add_argument(
+        "--skip-minor-updates", action="store_true",
+        help="Ignorer les nœuds dont les seules mises à jour en attente "
+             "sont des paquets Debian mineurs (aucun changement de noyau, "
+             "aucun paquet pve-*/proxmox-*, aucun reboot en attente) : "
+             "ni évacuation ni upgrade ni reboot pour eux. Conçu pour la "
+             "REPRISE après incident : Debian publie des MAJ mineures "
+             "pendant un run, et chaque nœud déjà traité se verrait "
+             "sinon infliger une évacuation complète pour presque rien. "
+             "Les MAJ ignorées (parfois des correctifs de sécurité) ne "
+             "sont PAS supprimées, seulement différées : relancer plus "
+             "tard un run SANS cette option pour les appliquer.")
     parser.add_argument("--env-file", default="/etc/proxmox-updater/proxmox.env",
                         help="Fichier d'environnement contenant les secrets "
                              "(par défaut /etc/proxmox-updater/proxmox.env).")
@@ -7725,7 +8134,7 @@ def main():
     global EST_MIGRATE_SPEED, EST_MIGRATE_OVERHEAD_S
     global EST_APT_MIN, EST_UPGRADE_MIN, EST_REBOOT_MIN
     global STATS_FILE, STATS_MAX_SAMPLES
-    global MIGRATE_TIMEOUT
+    global MIGRATE_TIMEOUT, MIGRATE_ATTEMPTS, START_TIMEOUT
     API_HOST = _env("PVE_API_HOST", API_HOST)
     # PVE_API_HOSTS et PVE_EST_* : relus APRÈS le fichier d'env comme les
     # autres — sinon une valeur posée UNIQUEMENT dans ce fichier serait
@@ -7747,6 +8156,10 @@ def main():
     # la valeur d'import, avant chargement du fichier env).
     MIGRATE_TIMEOUT = int(_env("PVE_MIGRATE_TIMEOUT",
                                str(MIGRATE_TIMEOUT)))
+    MIGRATE_ATTEMPTS = int(_env("PVE_MIGRATE_ATTEMPTS",
+                                str(MIGRATE_ATTEMPTS)))
+    START_TIMEOUT = int(_env("PVE_START_TIMEOUT",
+                             str(START_TIMEOUT)))
     derived = stats_derive(load_stats())
     EST_PROV.clear()
     EST_MIGRATE_SPEED = int(_env(
@@ -7828,7 +8241,7 @@ def main():
         client = ProxmoxClient(logger)
 
         updater = Updater(logger, dry, client)
-        updater.run(args.node)
+        updater.run(args.node, skip_minor=args.skip_minor_updates)
         sys.exit(0)
     except KeyboardInterrupt:
         # Ctrl-C : les blocs finally ont DÉJÀ restauré l'état zéro
