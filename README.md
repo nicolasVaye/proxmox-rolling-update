@@ -475,7 +475,12 @@ fin de fichier), et la comparaison avant/après écriture est normalisée
   fenêtre de stabilité CRM de 60 s (les règles `node-affinity` restent
   désactivées jusqu'à la fin de l'Étape 1, sauf en mode `--node` où elles
   sont réactivées ici). L'état est persisté dans le JSON à chaque
-  mutation.
+  mutation. **Budget de stabilité adapté (v22)** : la fenêtre CRM n'a pas
+  un budget fixe — le failback du CRM est une live migration
+  RAM-dépendante qui peut largement dépasser 10 min ; le budget monte
+  donc à la durée estimée de la migration la plus longue en cours et
+  chaque nouvelle tâche CRM rouvre une manche (cf.
+  `PVE_HA_SETTLE_TIMEOUT` / `PVE_HA_SETTLE_MAX_TOTAL`).
 
 **Étape 2 — Rééquilibrage final** : AVANT l'optimisation RAM, un
 **rapatriement des hors-règle** ramène sur un nœud de leur règle
@@ -525,7 +530,13 @@ elle ne la crée pas : la consommation réelle du cluster est inchangée.
 Un « NB : » sous les bandeaux ÉTAT INITIAL et ÉTAT FINAL rappelle
 cette sémantique dans le log. En run `--execute` ayant modifié le
 cluster, l'état final est **re-lu** après la fenêtre de stabilité CRM :
-il montre alors l'usage réel mesuré, sans NB.
+il montre alors l'usage réel mesuré, sans NB. C'est à cet endroit que
+s'est produit l'incident corrigé en **v22** : le CRM rapatriait une
+grosse VM par live migration de ~9 min ; le budget global fixe de
+600 s a expiré **15 s avant** la fin de la fenêtre de confirmation →
+FATAL « cluster instable » à tort, alors que le nœud était traité et
+le cluster déjà en état zéro. Le budget est désormais adapté à la RAM
+des migrations CRM en cours (vécu 19/11 : VM 500, failback post-run).
 
 ## Sécurités intégrées
 
@@ -860,9 +871,11 @@ Détails d'implémentation :
 | `PVE_EST_REBOOT_MIN` | `9` | reboot + retour + post-checks (min/nœud), bilan dry-run |
 | `PVE_STATS_FILE` | auto | Fichier de statistiques de durées (défaut : `.proxmox-rolling-update.stats` à côté du script) |
 | `PVE_STATS_MAX_SAMPLES` | `20` | Fenêtre glissante d'échantillons par catégorie |
-| `PVE_MIGRATE_TIMEOUT` | `600` | Plancher du timeout d'attente d'une tâche (s). La live migration QEMU d'une VM running reçoit un timeout **adapté à sa taille** : `max(plancher, 2 × durée estimée par le débit observé)`, plafonné à 3600 s — une VM de 160 Go à ~150 Mo/s converge en plus de 600 s |
+| `PVE_MIGRATE_TIMEOUT` | `600` | Plancher du timeout d'attente d'une tâche du script (s). La live migration QEMU d'une VM running reçoit un timeout **adapté à sa taille** : `max(plancher, 2 × durée estimée par le débit observé)`, plafonné à 3600 s — une VM de 160 Go à ~150 Mo/s converge en plus de 600 s. **v22 : n'agit plus sur l'attente de stabilité CRM** (désormais `PVE_HA_SETTLE_TIMEOUT`) |
 | `PVE_MIGRATE_ATTEMPTS` | `2` | Tentatives totales d'une même migration quand la première échoue sur un échec transitoire (reprise v18 sur course QEMU au « resume » ; `1` = comportement antérieur : FATAL immédiat) |
 | `PVE_START_TIMEOUT` | `300` | Attente max (s) du démarrage d'un guest (`qm`/`pct start`) pendant la reprise v18 — un gros guest met du temps à démarrer |
+| `PVE_HA_SETTLE_TIMEOUT` | `600` | **v22** — Plancher (s) du budget d'attente de stabilité du CRM HA (`wait_ha_settled`). Le budget est **adapté à la RAM** des migrations CRM en cours (même modèle de débit que les migrations du script) + fenêtre de confirmation 60 s + marge de décision CRM ; chaque changement du set de tâches CRM **rouvre une manche** avec budget recalculé (failback multi-VMs légitime — vécu : failback CRM de ~9 min tué à tort par le budget fixe, 15 s avant la réussite) ; `recover`/`fence`/`freeze`/`lost` ne réarment pas |
+| `PVE_HA_SETTLE_MAX_TOTAL` | `14400` | **v22** — Plafond **dur** (s) de la durée TOTALE d'attente de stabilité CRM, toutes manches de réarmement confondues (garde-fou anti-orage : migrations sans fin, recover/fence répétés) — 4 h par défaut |
 | `PVE_HOSTS_CHECK` | `1` | `0` : désactiver l'audit/correction des `/etc/hosts` de l'Étape 0-bis |
 | `PVE_LOG_FILE` | vide | Fichier de log parallèle (sans ANSI, stderr capturé) |
 | `PVE_STATE_FILE` | auto | Emplacement du fichier d'état JSON |

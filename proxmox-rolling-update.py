@@ -80,6 +80,23 @@ stopped du nœud. Correctif : initialisation du dict dans __init__ (et
 audit AST complet : aucun autre attribut de données lu sans
 initialisation).
 
+Budget de stabilité CRM adapté (v22) : l'attente de stabilité du CRM
+(wait_ha_settled) reconduisait un budget FIXE de 600 s — vécu 19/11
+13:14 : le failback CRM de la VM 500 (live migration RAM-dépendante
+de ~9 min) a consommé tout le budget + presque la fenêtre de
+confirmation de 60 s → FATAL « cluster instable » 15 s AVANT la
+réussite, à tort : le CRM TRAVAILLAIT légitimement. Le budget est
+désormais DÉCOUPLÉ (PVE_HA_SETTLE_TIMEOUT, défaut 600 s) et ADAPTÉ :
+il monte à la durée ESTIMÉE de la migration la plus longue en cours
+(même modèle de débit que nos propres migrations, RAM lue dans
+/cluster/resources) + fenêtre de confirmation + marge de décision
+CRM ; chaque changement du set de tâches CRM ROUVERTE une manche avec
+budget recalculé (le CRM peut légitimement enchaîner plusieurs
+migrations, gros failback multi-VMs) ; les états recover/fence/… ne
+réarment pas (déjà un signe de souci) ; garde-fou dur : plafond TOTAL
+PVE_HA_SETTLE_MAX_TOTAL (défaut 4 h) au-delà duquel seul le FATAL
+« cluster instable » est justifié.
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
@@ -93,7 +110,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "21"
+SCRIPT_VERSION = "22"
 
 import argparse
 import base64
@@ -227,6 +244,36 @@ START_TIMEOUT = int(_env("PVE_START_TIMEOUT", "300"))
                                 # guest (qm/pct start) pendant la reprise
                                 # v18 — un guest 192G met du temps à
                                 # redémarrer, 300s couvre large.
+HA_SETTLE_TIMEOUT = int(_env("PVE_HA_SETTLE_TIMEOUT", "600"))
+                                # BUDGET DE STABILITÉ CRM v22 (plancher,
+                                # s) — wait_ha_settled. DÉCOUPLÉ de
+                                # PVE_MIGRATE_TIMEOUT (qui reste le
+                                # plancher du timeout d'UNE tâche de
+                                # migration) : c'est le plancher du
+                                # budget d'une « manche » d'attente de
+                                # stabilité du CRM. Vécu 19/11 13:14 :
+                                # le failback CRM de la VM 500 (live
+                                # migration RAM-dépendante de ~9 min) a
+                                # consommé tout le budget global fixe de
+                                # 600 s ; FATAL « cluster instable »
+                                # 15 s AVANT la fin de la fenêtre de
+                                # confirmation, alors que le CRM
+                                # travaillait légitimement. Le budget est
+                                # désormais ADAPTÉ à la RAM des guests
+                                # en migration (cf. wait_ha_settled).
+HA_SETTLE_MAX_TOTAL = int(_env("PVE_HA_SETTLE_MAX_TOTAL", "14400"))
+                                # plafond DUR (s) de la durée TOTALE
+                                # d'attente de stabilité CRM, toutes
+                                # manches de réarmement confondues :
+                                # garde-fou anti-orage (migrations qui
+                                # s'enchaînent sans fin, recover/fence
+                                # répétés). 4 h par défaut.
+HA_SETTLE_UNKNOWN_RAM_EST = 1200
+                                # durée estimée (s) d'une migration CRM
+                                # quand la RAM du guest est illisible
+                                # dans /cluster/resources (conservateur :
+                                # une VM de 160 Go chargée converge en
+                                # ~1100 s réels, vécu).
 CEPH_TIMEOUT = 900              # secondes max d'attente d'un Ceph HEALTH_OK
 REBOOT_TIMEOUT = 900            # secondes max d'attente du retour d'un nœud
 
@@ -3204,9 +3251,34 @@ class ProxmoxClient:
         ressources (états transitoires : migrate, relocate, recover,
         fence, freeze, lost). En fin de run, garantir un cluster stable
         avant le rapport final.
-        timeout=None → MIGRATE_TIMEOUT lu À L'APPEL (le défaut d'un
+        timeout=None → HA_SETTLE_TIMEOUT lu À L'APPEL (le défaut d'un
         argument serait figé à sa valeur d'import, avant la relecture
         du --env-file par main()).
+
+        BUDGET ADAPTÉ v22 (vécu 19/11 13:14 : le failback CRM de la VM
+        500, live migration RAM-dépendante de ~9 min, a consommé tout
+        le budget FIXE de 600 s + presque la fenêtre de confirmation de
+        60 s → FATAL « cluster instable » 15 s AVANT la réussite, à
+        tort : le CRM TRAVAILLAIT légitimement). Le budget d'une
+        « manche » n'est plus un nombre fixe :
+        - plancher : PVE_HA_SETTLE_TIMEOUT (défaut 600 s), découplé
+          de PVE_MIGRATE_TIMEOUT qui reste le plancher du timeout
+          d'UNE tâche de migration ;
+        - si des tâches migrate/relocate sont en cours, le budget monte
+          à la durée ESTIMÉE de la plus longue (même modèle de débit
+          que nos propres migrations, _migrate_timeout_for, plafonné)
+          + la fenêtre de confirmation + 60 s de marge de décision CRM ;
+        - à CHAQUE changement du set de tâches, la manche repart à
+          zéro avec un budget recalculé : le CRM peut ENCHAINER des
+          migrations légitimes (failback de plusieurs VMs, gros
+          rééquilibrage RAM-dépendant) sans être tué par un budget
+          global — c'est le travail normal d'un cluster multi-VMs ;
+        - les états recover/fence/freeze/lost ne réarment PAS le
+          budget : ce ne sont pas des transferts, c'est déjà le signe
+          d'un souci de santé → ils restent soumis au plancher ;
+        - garde-fou DUR : la durée TOTALE toutes manches confondues
+          est plafonnée à PVE_HA_SETTLE_MAX_TOTAL (défaut 4 h), au-delà
+          seulement le FATAL « cluster instable » est justifié.
 
         NB : un instantané unique ne suffit PAS. À la sortie du mode
         maintenance, le CRM met plusieurs secondes (voire dizaines) à
@@ -3216,41 +3288,117 @@ class ProxmoxClient:
         stable PENDANT stable_window secondes consécutives : toute
         tâche qui démarre dans la fenêtre réarme le compteur."""
         if timeout is None:
-            timeout = MIGRATE_TIMEOUT
+            timeout = HA_SETTLE_TIMEOUT
         transient = ("migrate", "relocate", "recover", "fence", "freeze", "lost")
-        t0 = time.time()
-        stable_since = None
+        transfer = ("migrate", "relocate")
+        t_all = time.time()
+        round_t0 = t_all
+        round_budget: float = timeout
+        prev_sig: Optional[frozenset] = None
+        ram_memo: Dict[str, Optional[int]] = {}
+        stable_since: Optional[float] = None
         last_beat = 0
-        while time.time() - t0 < timeout:
+
+        def _ram_of(sid: str) -> Optional[int]:
+            """RAM max déclarée du guest derrière une sid 'vm:500' :
+            GET /cluster/resources (lecture pure), mémoïsée par sid.
+            None si illisible -> estimation conservatrice dédiée.
+            NB : le préfixe HA ('vm:500') ne correspond PAS au type
+            des ressources ('qemu/500') : vm->qemu, ct->lxc."""
+            if sid in ram_memo:
+                return ram_memo[sid]
+            ram: Optional[int] = None
+            try:
+                parts = str(sid).split(":", 1)
+                if len(parts) == 2:
+                    kind = {"vm": "qemu", "ct": "lxc"}.get(parts[0],
+                                                          parts[0])
+                    rid = f"{kind}/{parts[1]}"
+                else:
+                    rid = None
+                for r in self.with_api(lambda p: p.cluster.resources.get()):
+                    if rid is not None and r.get("id") == rid:
+                        try:
+                            ram = int(r.get("maxmem", 0) or 0) or None
+                        except (TypeError, ValueError):
+                            ram = None
+                        break
+            except Exception:
+                ram = None
+            ram_memo[sid] = ram
+            return ram
+
+        while True:
+            now = time.time()
+            if now - t_all > HA_SETTLE_MAX_TOTAL:
+                raise RuntimeError(
+                    f"Le CRM HA a toujours des tâches en cours après "
+                    f"{int(now - t_all)}s (plafond total "
+                    f"{HA_SETTLE_MAX_TOTAL}s) — cluster instable")
             items = self.with_api(lambda p: p.cluster.ha.status.current.get())
             busy = [i for i in items if i.get("type") == "service"
                     and any(t in str(i.get("state", "")) for t in transient)]
+            sig = frozenset(f"{i.get('sid')}|{i.get('state')}" for i in busy)
+            if sig != prev_sig:
+                # NOUVELLE MANCHE : apparition/disparition/changement
+                # d'état d'au moins une tâche CRM -> budget recalculé.
+                prev_sig = sig
+                round_t0 = now
+                stable_since = None
+                est = 0
+                why: List[str] = []
+                for i in busy:
+                    st = str(i.get("state", ""))
+                    if not any(t in st for t in transfer):
+                        continue    # recover/fence/... : pas un transfert
+                    ram = _ram_of(str(i.get("sid")))
+                    e = (_migrate_timeout_for(ram)
+                         if ram else HA_SETTLE_UNKNOWN_RAM_EST)
+                    est = max(est, e)
+                    why.append(
+                        f"{i.get('sid')} ("
+                        + (f"{ram // (1024 ** 3)} GiB, ~{e}s" if ram
+                           else f"RAM illisible, ~{e}s") + ")")
+                round_budget = timeout
+                if est:
+                    # + fenêtre de confirmation + marge de décision CRM
+                    round_budget = max(timeout, est + 2 * stable_window + 60)
+                if busy:
+                    self.log.info(
+                        "  CRM HA : manche de tâches — budget "
+                        + (f"{int(round_budget)}s"
+                           + (f" (migrate/relocate : {', '.join(why)})"
+                              if why else ""))
+                        + f", plafond total {HA_SETTLE_MAX_TOTAL//60} min")
             if not busy:
                 if stable_since is None:
-                    stable_since = time.time()
+                    stable_since = now
                     self.log.info(
                         f"CRM HA : aucune tâche en cours — confirmation "
                         f"pendant {stable_window}s…")
-                elif time.time() - stable_since >= stable_window:
+                elif now - stable_since >= stable_window:
                     self.log.info(f"CRM HA : cluster stable depuis "
                                   f"{stable_window}s ✔")
                     return
             else:
                 stable_since = None
+                if now - round_t0 > round_budget:
+                    raise RuntimeError(
+                        f"Le CRM HA a toujours des tâches en cours après "
+                        f"{int(now - round_t0)}s (budget de manche "
+                        f"{int(round_budget)}s) — cluster instable")
                 self.log.info("  CRM HA : tâches en cours — "
                               + ", ".join(f"{i.get('sid')} ({i.get('state')})"
                                           for i in busy))
             # battement de cœur pendant la fenêtre de stabilité :
             # un point toutes les 15s prouve que le script tourne toujours
-            elapsed = int(time.time() - t0)
+            elapsed = int(time.time() - t_all)
             if elapsed - last_beat >= 15 and stable_since is not None:
                 last_beat = elapsed
                 self.log.info("  … CRM HA : stabilité confirmée "
-                               f"depuis {int(time.time() - stable_since)}s "
-                               f"/ {stable_window}s")
+                              f"depuis {int(time.time() - stable_since)}s "
+                              f"/ {stable_window}s")
             time.sleep(5)
-        raise RuntimeError(f"Le CRM HA a toujours des tâches en cours "
-                           f"après {timeout}s — cluster instable")
 
     def ceph_status(self) -> Optional[Dict]:
         """Santé globale Ceph via GET /cluster/ceph/status.
