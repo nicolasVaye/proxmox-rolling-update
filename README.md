@@ -311,6 +311,10 @@ python3 proxmox_rolling_update.py --execute
 # Un seul nœud
 python3 proxmox_rolling_update.py --execute --node pve-node3
 
+# Reprise rapide après incident : ignorer les nœuds dont les seules MAJ
+# en attente sont des paquets Debian mineurs (v19)
+python3 proxmox_rolling_update.py --execute --skip-minor-updates
+
 # Fichier env et log spécifiques, verbosité
 python3 proxmox_rolling_update.py --execute \
     --env-file ./proxmox.env.mycluster \
@@ -319,6 +323,24 @@ python3 proxmox_rolling_update.py --execute \
 
 Le fichier env est **obligatoire** (`--env-file`, défaut
 `/etc/proxmox-updater/proxmox.env`) : sans lui le script s'arrête.
+
+**`--skip-minor-updates` (v19)** : conçu pour la **reprise après
+incident**. Un run complet dure ~5 h ; Debian publie des MAJ mineures
+pendant ce temps, et chaque nœud déjà traité se verrait sinon infliger
+une évacuation complète (~25 min) pour quelques paquets sans importance.
+Avec l'option, un nœud dont les seules MAJ en attente sont des paquets
+Debian mineurs est **ignoré** : ni évacuation ni upgrade ni reboot,
+les VMs restent en place. Un nœud reste **toujours traité** si sa
+simulation apt montre un **changement de noyau** (`proxmox-kernel`/
+`linux-image`), un **changement de version PVE** (paquet `pve-*` ou
+`proxmox-*` : pve-manager, pve-qemu-kvm…) ou un **reboot en attente**
+(noyau courant ≠ dernier installé, `/var/run/reboot-required`, ou le cas
+« run interrompu entre l'upgrade et le reboot »). Les MAJ ignorées ne
+sont **pas supprimées, seulement différées** — les mineures Debian
+contiennent souvent des correctifs de sécurité : repasser un run
+**sans** l'option dans une autre fenêtre pour les appliquer. L'option
+n'est pas active par défaut ; un récap en fin de run liste les nœuds
+ignorés et le rappelle.
 
 **Version du script** : la **première ligne de chaque run** (console ET
 fichier de log) affiche `proxmox-rolling-update — version <N>`, et la
@@ -336,11 +358,41 @@ détecté et la **récupération** s'exécute (voir plus bas). En dry-run,
 simple rapport — sauf pour les règles `node-affinity` du fichier d'état,
 qui sont réactivées POUR DE VRAI (cf. ci-dessous).
 
+**Étape 0-bis — Cohérence des `/etc/hosts` (v15-v17)** : chaque
+`/etc/hosts` doit résoudre TOUS les nœuds du cluster par leur nom court
+(corosync, migrations live, ceph, SSH inter-nœuds s'appuient dessus
+quand le DNS n'a pas réponse). Audit complet en lecture AVANT la
+première évacuation, nœud par nœud sur le fichier entier : nœud
+**manquant** (ajout « IP FQDN nom »), **incohérent** (IP ≠ l'IP de
+gestion connue de l'API, ou FQDN sans alias court — `getent` ne résout
+alors pas le nom court), **doublon**, entrée **obsolète** de la famille
+du cluster. En dry-run : rapport seulement ; en `--execute` :
+correction par nœud après **sauvegarde datée**, puis re-vérification
+(le run est refusé si un nœud ne peut pas être corrigé : un
+`/etc/hosts` faux en pleine migration casse la résolution de noms au
+pire moment). Les fichiers **conformes ne sont pas réécrits** ; le
+fichier corrigé garde sa structure d'origine — les ajouts atterrissent
+dans leur **bloc canonique** (bouclage, nœuds du cluster, le reste,
+section IPv6, retraits en dernier — tri v17 au lieu d'un empilement en
+fin de fichier), et la comparaison avant/après écriture est normalisée
+`\r`/`\n` (écriture via PTY, v16 — sinistre : le fichier réputé identique
+était réécrit en boucle à chaque diff fantôme). Désactivable via
+`PVE_HOSTS_CHECK=0`.
+
 **Étape 1 — par nœud** (dans l'ordre du cluster) :
 - `apt update` + diagnostic espace disque : besoin estimé
   (`2 × taille installée + téléchargements + marge max(1 G, 5 %)`) comparé
   au libre (`/`, `/var`, `/boot/efi`). Si rien à mettre à jour : nœud
-  sauté, ni évacuation ni reboot.
+  sauté, ni évacuation ni reboot (sauf **reboot en attente** sans
+  paquets : maintenance complète SANS upgrade, cf. « Reprise après
+  interruption »). Avec `--skip-minor-updates` (v19), un nœud dont les
+  seules MAJ sont des paquets **Debian mineurs** est ignoré de la même
+  façon à ce stade : ni évacuation ni upgrade ni reboot, VMs en place,
+  nœud listé dans le récap final — sauf si la simulation apt montre un
+  noyau (`proxmox-kernel`/`linux-image`), un paquet `pve-*`/`proxmox-*`
+  ou un reboot en attente : ces changements sont **significatifs** et
+  le nœud passe en maintenance normalement (un noyau en attente n'est
+  JAMAIS ignoré).
 - Détachement HA (`ignored` + label, état d'origine mémorisé) puis mode
   maintenance HA.
 - **Mise en sommeil temporaire de TOUTES les règles `node-affinity`**
@@ -524,6 +576,20 @@ il montre alors l'usage réel mesuré, sans NB.
   `pvesh get /nodes/<nœud>/tasks/<upid>/log`), la migration est
   considérée réussie et le run continue ; `ERROR` échoue toujours
   immédiatement.
+- **Reprise sur échec de migration (v18)** : une live migration peut
+  échouer **après un transfert complet**, sur une course QEMU au
+  « resume » du tunnel (« `ERR: resume failed - VM n not running` »,
+  tâche « `migration problems` », VM retrouvée ARRÊTÉE — vécu : VM 374,
+  transfert 3,2 Go OK, downtime 94 ms). Le run n'abandonne plus : il
+  **localise** la VM (cible ou source), la **redémarre** si elle a été
+  assommée par la course (sur la cible si ses disques y sont déjà,
+  sinon sur sa source pour restaurer le service), vérifie le guest après
+  chaque migration **réussie** aussi (l'agent guest / le statut réel —
+  une tâche peut finir en OK avec la VM revenue arrêtée), puis
+  **retente** la migration (`PVE_MIGRATE_ATTEMPTS` tentatives au total,
+  défaut 2 ; `PVE_START_TIMEOUT` pour le redémarrage). Le FATAL ne
+  survient qu'après épuisement des tentatives ou VM irrécupérable —
+  jamais une VM éteinte sans avoir tenté de la relancer d'abord.
 - **Compatibilité QEMU/machine pendant le rolling upgrade (v13)** :
   une VM démarrée sur un nœud déjà upgradé peut résoudre une machine
   que les nœuds pas encore upgradés refusent
@@ -582,6 +648,20 @@ tout `apt-get update`. Un `Ctrl-C` pendant le traitement d'un nœud
 **fige** l'état (nœud laissé en maintenance, ressources HA laissées en
 `ignored`) : un apt tué à mi-chemin laisse un nœud potentiellement
 incohérent, la reprise se fera par le fichier d'état au run suivant.
+
+**Reprise après incident avec `--skip-minor-updates` (v19)** : le pire
+moment d'un long run, c'est de le RELANCER — Debian a publié des MAJ
+mineures pendant les ~5 h du premier passage, et chaque nœud déjà
+traité se voit infliger une évacuation complète (~25 min) pour
+quelques paquets. L'option rend ces nœuds quasi-gratuits : seuls les
+nœuds avec un vrai changement **significatif** (noyau, paquet
+`pve-*`/`proxmox-*`, reboot en attente) ou pas encore traités passent
+en maintenance — moins d'événements de migration, donc aussi moins de
+courses QEMU au « resume ». **Caveat sécurité** : les mineures Debian
+contiennent souvent des correctifs de sécurité — l'option les DIFFÈRE
+par choix, n'en faites pas le mode par défaut. Usage recommandé :
+relancer avec l'option pour la reprise, puis repasser un run SANS
+l'option dans une autre fenêtre pour rattraper les paquets différés.
 
 Si le fichier d'état a disparu alors que des flags de maintenance
 `CEPH_MAINT_FLAGS` sont encore posés (flags « orphelins »), l'Étape 0 les
@@ -653,6 +733,15 @@ Si le cluster a du Ceph (détection automatique, silencieuse sinon) :
   `mon_clock_drift_allowed` n'est JAMAIS relevé (déconseillé par la
   documentation Ceph). Prévention durable : `makestep 1.0 3` dans
   `chrony.conf` fait sauter l'heure d'office au boot.
+- **Parsing du health check robuste (v14)** : le champ « summary » du
+  health est normalisé en texte AVANT tout parsing — PVE 9.x le
+  renvoie comme **objet** `{"message": …, "severity": …}` (format
+  dominant de `/cluster/ceph/status`) tandis que d'autres
+  versions/chemins renvoient la chaîne brute ; passer le dict
+  directement à `re.search` levait « expected string or bytes-like
+  object, got 'dict' » et faisait planter la gate post-reboot en
+  plein milieu de run (vécu : nœud p-proxpra-c01, 18/11). Un point
+  unique de normalisation couvre les trois sites qui lisent ce champ.
 - **Diagnostic détaillé** (codes des checks, sévérité, résumé, 3
   détails) loggé à chaque état non-OK rencontré.
 
@@ -761,6 +850,9 @@ Détails d'implémentation :
 | `PVE_STATS_FILE` | auto | Fichier de statistiques de durées (défaut : `.proxmox-rolling-update.stats` à côté du script) |
 | `PVE_STATS_MAX_SAMPLES` | `20` | Fenêtre glissante d'échantillons par catégorie |
 | `PVE_MIGRATE_TIMEOUT` | `600` | Plancher du timeout d'attente d'une tâche (s). La live migration QEMU d'une VM running reçoit un timeout **adapté à sa taille** : `max(plancher, 2 × durée estimée par le débit observé)`, plafonné à 3600 s — une VM de 160 Go à ~150 Mo/s converge en plus de 600 s |
+| `PVE_MIGRATE_ATTEMPTS` | `2` | Tentatives totales d'une même migration quand la première échoue sur un échec transitoire (reprise v18 sur course QEMU au « resume » ; `1` = comportement antérieur : FATAL immédiat) |
+| `PVE_START_TIMEOUT` | `300` | Attente max (s) du démarrage d'un guest (`qm`/`pct start`) pendant la reprise v18 — un gros guest met du temps à démarrer |
+| `PVE_HOSTS_CHECK` | `1` | `0` : désactiver l'audit/correction des `/etc/hosts` de l'Étape 0-bis |
 | `PVE_LOG_FILE` | vide | Fichier de log parallèle (sans ANSI, stderr capturé) |
 | `PVE_STATE_FILE` | auto | Emplacement du fichier d'état JSON |
 
