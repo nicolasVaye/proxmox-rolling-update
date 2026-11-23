@@ -4,7 +4,7 @@ Mise à jour glissante (*rolling update*) d'un cluster **Proxmox VE** —
 `apt full-upgrade` + reboot, **un nœud à la fois**, sans fencing inattendu,
 avec gestion du HA, de Ceph (si présent) et rééquilibrage final du cluster.
 
-Deux scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
+Trois scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
 
 - `proxmox_rolling_update.py` — mise à jour des nœuds PVE (ce README) ;
 - `proxmox_ceph_rolling_update.py` — mise à jour glissante de Ceph :
@@ -240,7 +240,6 @@ Deux scripts Python 3 (dépendances : `proxmoxer`, `paramiko`) :
   Connexion SSH persistante par nœud
   (`PVE_SSH_RETRIES`), stderr capturé dans le fichier de log, bilan
   signalant explicitement les runs interrompus — voir son docstring.
-
 ---
 
 ## Sommaire
@@ -428,10 +427,15 @@ fin de fichier), et la comparaison avant/après écriture est normalisée
   node-affinity pendant TOUTE l'Étape 1 — une règle `strict=1` ne peut
   plus bloquer l'évacuation du nœud, et le CRM ne décide plus de relocate
   à chaque sortie de maintenance (churn en pleine évacuation du nœud
-  suivant). Les règles sont restaurées à la FIN de l'Étape 1,
-  avant le rapatriement/rééquilibrage, qui redeviennent contraints par les
-  règles ; en mode `--node`, la fin d'Étape 1 est la sortie de maintenance
-  du nœud. Les règles déjà désactivées par un admin ne sont pas touchées ;
+  suivant). Les règles sont restaurées en **fin de run, APRÈS le
+  rapatriement/rééquilibrage (v24)** : le MODÈLE interne est rendu dès
+  la fin de l'Étape 1 (le planning reste contraint par les règles),
+  mais la réactivation CLUSTER attend que le script n'ait plus AUCUNE
+  migration en cours — vécu 23/11/2026 : réactivées plus tôt, elles
+  déclenchaient le failback CRM du même guest que le script rapatriait
+  (VM 501 verrouillée « migrate », FATAL au POST). Le failback CRM
+  éventuel n'a plus qu'un seul point d'entrée : la fenêtre de
+  stabilité finale. Les règles déjà désactivées par un admin ne sont pas touchées ;
   les `resource-affinity` (« keep separate » / « together ») ne sont
   **jamais** touchées : contraintes de sécurité, actives du début à la
   fin. Les mises en sommeil sont persistées dans le fichier d'état.
@@ -479,6 +483,24 @@ fin de fichier), et la comparaison avant/après écriture est normalisée
   après son traitement (`(après traitement du nœud)`) — un rolling
   upgrade qui touche les paquets `pve-*`/`proxmox-*` se lit directement
   dans le log, nœud après nœud, avant/après.
+- **Fin de course CRM supprimée, verrous « migrate » attendus (v24)** :
+  vécu 23/11/2026 : les règles `node-affinity` réactivées JUSTE AVANT le
+  rapatriement, le CRM avait aussitôt lancé SON failback de la VM 501
+  (V-OSPCTRL-02, ~153 Go) vers… la même cible que le plan du script :
+  le POST migrate se heurtait au verrou (« VM is locked (migrate) »,
+  500 DÉTERMINISTE identique sur tous les hôtes), déclenchait pourtant
+  le carrousel complet des 13 hôtes API (~26 s par tentative) plus le
+  faux diagnostic « la requête fait probablement planter pveproxy »,
+  puis FATAL — alors que le CRM plaçait la VM exactement où le script
+  voulait l'envoyer. Trois correctifs : (1) la réactivation CLUSTER des
+  règles est **différée à la fin de TOUTES les migrations** (dégel
+  compris), juste avant la fenêtre de stabilité CRM — le modèle interne
+  reste contraint dès la fin de l'Étape 1, seul le cluster attend ;
+  (2) « is locked » est classé **déterministe** dans le failover API
+  (aucun carrousel) ; (3) `migrate_vm` **attend la levée du verrou**
+  (battements en log), **localise** le guest (la tâche extérieure l'a
+  peut-être déjà placé sur la cible : succès sans rien migrer) puis
+  retente depuis son nœud réel.
 - **VMs arrêtées : laissées sur place** (aucune migration) — une VM éteinte
   ne court aucun risque pendant l'upgrade et le reboot ; sa ressource HA
   reste détachée puis réactivée dans son état d'origine (`stopped`), sans
@@ -506,8 +528,7 @@ fin de fichier), et la comparaison avant/après écriture est normalisée
 - `finally` en **tout état de cause** : retrait des flags Ceph, sortie de
   maintenance, réactivation des ressources HA dans leur état d'origine,
   fenêtre de stabilité CRM de 60 s (les règles `node-affinity` restent
-  désactivées jusqu'à la fin de l'Étape 1, sauf en mode `--node` où elles
-  sont réactivées ici). L'état est persisté dans le JSON à chaque
+  désactivées jusqu'à la fin du run, tout mode confondu — v24). L'état est persisté dans le JSON à chaque
   mutation. **Budget de stabilité adapté (v22)** : la fenêtre CRM n'a pas
   un budget fixe — le failback du CRM est une live migration
   RAM-dépendante qui peut largement dépasser 10 min ; le budget monte
@@ -540,8 +561,9 @@ DUREs échouaient AVANT le rééquilibrage, leurs nœuds de règle
 reprenaient de la place juste après) — elles sont ramenées à ce
 moment-là (mention « 2e passe post-rééquilibrage » dans le log) et le
 dégel final n'a vraiment plus rien à corriger. Si la seconde passe
-échoue aussi, la ressource reste hors règle : le CRM décidera au
-dégel — relocalisation certaine pour une règle DURE, probable pour
+échoue aussi, la ressource reste hors règle : le CRM décidera à la
+réactivation des règles (fin de run, v24), sous la fenêtre de
+stabilité — relocalisation certaine pour une règle DURE, probable pour
 une soft (comportement attendu, pas une anomalie).
 
 **Bilan final** : tables d'occupation avant/après, synthèse des
@@ -585,9 +607,9 @@ des migrations CRM en cours (vécu 19/11 : VM 500, failback post-run).
   intactes) pendant toute
   l'Étape 1 — sans cela, une règle `strict=1` peut bloquer l'évacuation
   et le `apt full-upgrade` avec lui, et le CRM décide des relocate à
-  chaque sortie de maintenance. Restauration à la fin de
-  l'Étape 1, avant le rééquilibrage : un seul point de failback, au
-  moment où le cluster est de nouveau complet — réactivation PVE 9 par
+  chaque sortie de maintenance. Restauration en **fin de run, APRÈS le
+  rééquilibrage (v24)** : un seul point de failback, quand le script
+  n'a plus aucune migration en cours — réactivation PVE 9 par
   **suppression du flag `disable`** (`disable=0` ne suffit plus),
   chaque mise en sommeil et chaque restauration **vérifiées par
   re-lecture** (un PUT accepté sans effet déclenche la cascade ou une

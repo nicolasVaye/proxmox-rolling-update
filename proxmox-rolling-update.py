@@ -103,6 +103,32 @@ noyau : « p-shm1-proxspv-18: version PVE=9.2.26 ») et à nouveau après
 le traitement du nœud (preuve directe de la montée de version quand
 les paquets pve-*/proxmox-* étaient dans la liste apt).
 
+Fin de course CRM supprimée, verrous « migrate » attendus (v24) :
+vécu 23/11/2026 10:47 : le run déroulait l'Étape 2 quand le
+rapatriement de la VM 501 (V-OSPCTRL-02, ~153 Go, règle soft sur les
+nœuds shm1, evacuée vers p-pes-proxspv-21) a échoué en 500
+« VM is locked (migrate) ». Deux défauts conjoints : (1) les règles
+node-affinity étaient RÉACTIVÉES juste avant le rapatriement — le
+CRM a aussitôt lancé SON failback de la VM 501 vers... la même
+cible que le script (p-shm1-proxspv-18), et le script s'est heurté
+à son verrou « migrate » ; l'erreur, DÉTERMINISTE (le verrou vit
+dans le pmxcfs), déclenchait pourtant le carrousel complet des 13
+hôtes API (~26 s par tentative, ×2) plus le FAUX diagnostic « la
+requête fait probablement planter pveproxy », puis FATAL — alors
+que le CRM plaçait la VM exactement où le script voulait l'envoyer.
+Correctifs : (1) la réactivation CLUSTER des règles est DIFFÉRÉE à
+la fin de TOUTES les migrations du script (rapatriement +
+rééquilibrage + dégel), juste avant la fenêtre de stabilité CRM
+finale — le modèle INTERNE est restauré dès la fin de l'Étape 1 (le
+planning reste contraint par les règles) mais le CRM ne reçoit ses
+règles qu'une fois le script immobile ; (2) « is locked » est
+classé DÉTERMINISTE dans with_api (aucun carrousel) et migrate_vm
+ATTEND la levée du verrou (battement de progression), LOCALISE le
+guest (la tâche extérieure l'a peut-être déjà déplacée : s'il est
+DÉJÀ sur la cible, succès sans rien migrer) puis retente depuis son
+nœud réel ; (3) même en cas d'échec résiduel, le déroulé loggué
+distingue maintenant la course CRM d'une vraie panne.
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
@@ -116,7 +142,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "23"
+SCRIPT_VERSION = "24"
 
 import argparse
 import base64
@@ -2530,6 +2556,27 @@ class ProxmoxClient:
                         f"— requête refusée cluster-wide : erreur "
                         f"déterministe, aucune bascule d'hôte.")
                     raise
+                if "is locked" in msg:
+                    # VERROU de guest (« VM is locked (migrate) », 500 au
+                    # POST migrate) : une tâche tourne DÉJÀ sur la
+                    # ressource côté cluster — ex. le failback CRM
+                    # déclenché par la réactivation des règles
+                    # node-affinity, une migration admin, un backup. Le
+                    # verrou vit dans le pmxcfs : l'erreur est
+                    # DÉTERMINISTE, IDENTIQUE sur tous les hôtes API.
+                    # Vécu 23/11/2026 : un carrousel complet des 13 hôtes
+                    # (~26 s) PAR tentative, ×2 tentatives, plus le FAUX
+                    # diagnostic « la requête fait probablement planter
+                    # pveproxy », puis FATAL — alors que le failback CRM
+                    # de la VM 501 (~153 Go) plaçait la VM exactement où
+                    # le script voulait l'envoyer. Aucune bascule :
+                    # l'appelant (migrate_vm) attend la levée du verrou
+                    # et retente depuis l'état réel.
+                    self.log.error(
+                        f"Guest verrouillé ({msg}) — une tâche est EN "
+                        f"COURS sur le guest (verrou pmxcfs, identique "
+                        f"sur tous les hôtes) : aucune bascule d'hôte.")
+                    raise
                 if "proxy handshake" in msg or " 595" in msg \
                         or "595 Errors during connection" in msg:
                     # appel PROXIFIÉ vers le nœud cible : c'est la CIBLE
@@ -4533,7 +4580,110 @@ class ProxmoxClient:
         secondes/minutes selon le stockage).
         timeout : timeout EFFECTIF d'attente de la tâche (live QEMU :
         adapté à la taille de la VM par _migrate_timeout_for ; sinon
-        PVE_MIGRATE_TIMEOUT)."""
+        PVE_MIGRATE_TIMEOUT).
+        v24 — verrou concurrent : si le POST échoue en « is locked »,
+        une tâche tourne déjà sur le guest (failback CRM déclenché par
+        la réactivation des règles node-affinity, migration admin,
+        backup…). On attend la LEVÉE du verrou (vm_lock_wait), on
+        LOCALISE le guest — la tâche extérieure a pu le déplacer : il
+        est peut-être DÉJÀ sur la cible (succès sans rien migrer) ou
+        parti d'un autre nœud (retente depuis son nœud RÉEL). Vécu
+        23/11/2026 : FATAL « VM 501 » pour un failback CRM concurrent
+        qui plaçait la VM exactement où le script l'envoyait."""
+        try:
+            self._migrate_vm_once(node, vmid, target, vmtype, timeout)
+            return
+        except Exception as e:
+            if "is locked" not in str(e):
+                raise
+            kind = "CT" if vmtype == "lxc" else "VM"
+            wait_max = timeout if timeout is not None else MIGRATE_TIMEOUT
+            self.log.warning(
+                f"  {kind} {vmid} ({node} ➔ {target}) occupée par une "
+                f"tâche en cours ({e}) — attente de la levée du verrou "
+                f"({wait_max}s max), puis re-évaluation")
+            self.vm_lock_wait(node, vmid, vmtype, timeout=wait_max)
+            cur = self.vm_node(vmid)
+            if cur == target:
+                self.log.info(
+                    f"  {kind} {vmid} : DÉJÀ SUR {target} — la tâche "
+                    f"extérieure l'y a placée : migration INUTILE ✔")
+                return
+            if cur is not None and cur != node:
+                self.log.warning(
+                    f"  {kind} {vmid} : déplacée par la tâche extérieure "
+                    f"vers {cur} — nouvelle tentative depuis son nœud RÉEL")
+                node = cur
+            self._migrate_vm_once(node, vmid, target, vmtype, timeout)
+
+    def vm_lock_wait(self, node: str, vmid: int, vmtype: str,
+                     timeout: int = 900) -> None:
+        """Attend la LEVÉE du verrou d'un guest (champ « lock » de
+        status.current : « migrate », « backup », « snapshot »… — ou
+        config ABSENTE du nœud : la tâche détentrice vient de finir en
+        déplaçant le guest). Contexte v24 : le POST migrate d'un guest
+        occupé échoue en 500 « VM is locked (migrate) » — typiquement
+        le failback CRM lancé par la réactivation des règles
+        node-affinity, en course avec nos propres migrations. L'issue
+        de la tâche extérieure peut nous avoir déjà SERVI le résultat
+        voulu : on attend, on ne réclame pas. Battement de progression
+        et timeout borné (celui de la migration, env-effectif)."""
+        t0 = time.time()
+        announced = False
+        last_beat = 0
+        while time.time() - t0 < timeout:
+            st = self.vm_status(node, vmid, vmtype)
+            if st is None:
+                if announced:
+                    self.log.info(f"  … guest {vmid} : config partie de "
+                                  f"{node} — la tâche extérieure vient de "
+                                  f"finir ✔")
+                return
+            lock = str(st.get("lock") or "")
+            if not lock:
+                if announced:
+                    self.log.info(f"  … guest {vmid} : verrou levé sur "
+                                  f"{node} ({int(time.time() - t0)}s "
+                                  f"d'attente) ✔")
+                return
+            if not announced:
+                announced = True
+                self.log.warning(
+                    f"  Guest {vmid} verrouillée ('{lock}') sur {node} : "
+                    f"une tâche est en cours (ex. failback CRM) — "
+                    f"attente de sa fin ({timeout}s max)…")
+            elapsed = int(time.time() - t0)
+            if elapsed - last_beat >= 30:
+                last_beat = elapsed
+                self.log.info(f"  … guest {vmid} : verrou '{lock}' "
+                              f"toujours posé — {elapsed}s écoulées")
+            time.sleep(5)
+        raise RuntimeError(
+            f"guest {vmid} toujours verrouillé après {timeout}s — tâche "
+            f"extérieure en cours : vérifier son issue côté Proxmox avant "
+            f"de relancer")
+
+    def vm_node(self, vmid: int) -> Optional[str]:
+        """Nœud hébergeant ACTUELLEMENT un guest, recherche cluster-wide
+        (/cluster/resources, types 'qemu'/'lxc') — None si introuvable.
+        Post-attente de verrou (v24) : la tâche extérieure a pu
+        déplacer le guest ; toute migration doit repartir de son nœud
+        RÉEL, jamais d'une source périmée du plan."""
+        rows = self.with_api(lambda p: p.cluster.resources.get())
+        for r in rows or []:
+            try:
+                if int(r.get("vmid", -1)) == vmid \
+                        and str(r.get("type", "")) in ("qemu", "lxc"):
+                    return r.get("node") or None
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _migrate_vm_once(self, node: str, vmid: int, target: str, vmtype: str,
+                         timeout: Optional[int] = None):
+        """POST migrate + attente de la tâche : l'appel UNIQUE, sans
+        gestion de verrou (c'est migrate_vm qui gère la course aux
+        tâches concurrentes)."""
         if vmtype == "lxc":
             self.log.info(f"Migration du CT {vmid} : {node} ➔ {target} "
                           f"(mode restart : ARRET/REDÉMARRAGE, downtime court)")
@@ -5155,12 +5305,12 @@ class Updater:
         # planning du script pendant les migrations pilotées :
         #   {"rule": <définition ORIGINALE complète de la règle>,
         #    "was_disabled": False, "mode": "disable|resources|delete"}
-        # Réactivées à la FIN de l'Étape 1 (disable remis à son état
-        # d'origine, ou définition restaurée par fusion/recréation),
-        # rapatriement/rééquilibrage — une seule fois par run, pas à
-        # chaque sortie de maintenance de nœud (sinon le CRM re-décide
-        # des relocate à chaque nœud : churn). En mode --node, la fin de
-        # l'Étape 1 EST la sortie de maintenance du nœud. Persistées
+        # Réactivées (côté cluster) en FIN de run, APRÈS le
+        # rapatriement/rééquilibrage (v24) — une seule fois par run,
+        # pas à chaque sortie de maintenance de nœud (sinon le CRM
+        # re-décide des relocate à chaque nœud : churn, et même un
+        # failback concurrent en pleine migration, vécu 23/11). Le
+        # MODÈLE interne, lui, est restauré dès la fin de l'Étape 1. Persistées
         # dans le fichier d'état ("ha_rules") pour la reprise après
         # interruption, avec le MODE de mise en sommeil utilisé
         # (disable / ressources vidées / suppression — cf.
@@ -5174,11 +5324,12 @@ class Updater:
         self._ha_rule_mode_hint: Optional[str] = None
         # (ha_affinity, ha_affinity_hard) d'ORIGINE : sauvegarde au moment
         # de la désactivation des règles (ces deux structures ne sont
-        # alimentées QUE par les règles node-affinity), rendue à la
-        # réactivation — le rééquilibrage final et le rapatriement des
-        # hors-règle redeviennent contraints par les règles, comme le
-        # CRM. En mémoire uniquement : après une interruption, le run
-        # suivant reconstruit tout via fetch_state.
+        # alimentées QUE par les règles node-affinity), rendue à la FIN
+        # de l'Étape 1 (v24 : le planning du rapatriement et du
+        # rééquilibrage redevient contraint par les règles AVANT les
+        # migrations ; seule la réactivation CLUSTER attend la fin des
+        # migrations). En mémoire uniquement : après une interruption,
+        # le run suivant reconstruit tout via fetch_state.
         self._affinity_backup: Optional[Tuple[Dict[int, Set[str]],
                                               Dict[int, Set[str]]]] = None
         # Flags Ceph de maintenance posés PAR LE RUN (reboot planifié) :
@@ -6098,10 +6249,12 @@ class Updater:
     # `type`+`disable=1` ; sinon PUT `type`+`resources=""` — la règle
     # ne s'applique plus à rien, définition conservée ; sinon DELETE
     # temporaire avec recréation à l'identique) et on les restaure
-    # à la FIN de l'Étape 1, avant le rapatriement/rééquilibrage :
-    # ceux-ci redeviennent contraints par les règles et le dégel
-    # final reste cohérent (le CRM n'a pas une vague de relocate à
-    # corriger en pleine Étape 2). Les règles déjà désactivées par un
+    # en FIN de run, APRÈS le rapatriement/rééquilibrage (v24) :
+    # le MODÈLE interne reste contraint par les règles dès la fin de
+    # l'Étape 1 (le planning ne change pas), mais le CLUSTER ne
+    # reçoit ses règles que lorsque le script n'a plus AUCUNE
+    # migration en cours (le CRM ne peut pas lancer son failback en
+    # pleine phase pilotée — vécu 23/11 : VM 501 verrouillée). Les règles déjà désactivées par un
     # admin ne sont pas touchées. Les resource-affinity (« keep
     # separate » / « together ») ne sont JAMAIS touchées : contraintes
     # de sécurité de groupe, elles restent actives du début à la fin.
@@ -6478,24 +6631,57 @@ class Updater:
         self.log.info(f"{len(disabled)} règle(s) node-affinity mise(s) en "
                       f"sommeil pour l'Étape 1 ({', '.join(disabled)})"
                       f"{mode_note} — placement "
-                      f"LIBRE pendant les évacuations, restauration avant "
-                      f"le rééquilibrage.")
+                      f"LIBRE pendant les évacuations, restauration en "
+                      f"fin de run APRÈS le rapatriement/rééquilibrage "
+                      f"(v24 : le CRM ne reçoit ses règles que lorsque "
+                      f"le script n'a plus AUCUNE migration en cours).")
         # persister DANS TOUS LES MODES : les mises en sommeil sont
         # RÉELLES (dry-run compris) — un run tué en pleine Étape 1 doit
         # pouvoir être rattrapé par la reprise du run suivant.
         self._state_write()
 
-    def _ha_rules_restore_all(self, state: Optional[ClusterState]) -> None:
-        """Fin de l'Étape 1 : réactive les règles node-affinity mises en
-        sommeil au début du run — AVANT le rapatriement (--node) / le
-        rééquilibrage et le plan de failback des hors-règle : tout ce
-        qui suit redevient contraint par les règles, comme le CRM au
-        dégel final. Réactivation ADAPTÉE au mode utilisé (_ha_rule_
-        restore : disable remis à son état d'origine, ou définition
-        restaurée par fusion/recréation). En cas d'échec : la règle
-        reste dans le fichier d'état, le prochain run la réactivera.
-        L'action est effectuée POUR DE VRAI aussi en dry-run (miroir de
-        la mise en sommeil 2b-bis : test du mécanisme)."""
+    def _ha_rules_restore_all(self, state: Optional[ClusterState],
+                              cluster: bool = True) -> None:
+        """Règles node-affinity mises en sommeil au début du run.
+        cluster=True : RÉACTIVATION CLUSTER réelle (fin d'Étape 1 en mode
+        --node... plus exactement, depuis la v24, À LA FIN de toutes
+        les migrations du script — cf. run()). Réactivation ADAPTÉE au
+        mode utilisé (_ha_rule_restore : disable remis à son état
+        d'origine, ou définition restaurée par fusion/recréation). En
+        cas d'échec : la règle reste dans le fichier d'état, le
+        prochain run la réactivera. L'action est effectuée POUR DE
+        VRAI aussi en dry-run (miroir de la mise en sommeil 2b-bis :
+        test du mécanisme).
+        cluster=False (v24) : ne restaure QUE le MODÈLE INTERNE
+        (state.ha_affinity/_hard), pour que le planning du
+        rapatriement (--node) et du rééquilibrage reste contraint par
+        les règles — les règles côté cluster RESTENT en sommeil et le
+        fichier d'état continue de les tracer. Vécu 23/11/2026 : les
+        réactiver AVANT le rapatriement donnait au CRM une fenêtre
+        pour lancer son propre failback (VM 501 verrouillée
+        « migrate » : 500 au POST) en pleine phase pilotée par le
+        script — la réactivation est donc différée jusqu'à ce que le
+        script soit immobile."""
+        if state is not None and self._affinity_backup is not None:
+            aff, hard = self._affinity_backup
+            state.ha_affinity.clear()
+            state.ha_affinity.update({k: set(v)
+                                      for k, v in aff.items()})
+            state.ha_affinity_hard.clear()
+            state.ha_affinity_hard.update({k: set(v)
+                                           for k, v in hard.items()})
+            self._affinity_backup = None
+            if not cluster:
+                self.log.info(
+                    f"{len(self.ha_rules_snapshot)} règle(s) "
+                    f"node-affinity : modèle interne restauré (le "
+                    f"planning du rapatriement/rééquilibrage reste "
+                    f"contraint par les règles) — la RÉACTIVATION "
+                    f"CLUSTER est DIFFÉRÉE à la fin des migrations "
+                    f"(v24) : le CRM ne peut pas déclencher de "
+                    f"failback concurrent.")
+        if not cluster:
+            return
         if not self.ha_rules_snapshot:
             return
         reenabled: List[str] = []
@@ -6526,6 +6712,9 @@ class Updater:
             reenabled.append(rid)
         if reenabled:
             if state is not None and self._affinity_backup is not None:
+                # (modèle normalement déjà restauré par l'appel
+                # cluster=False de fin d'Étape 1 — ce bloc couvre les
+                # appels directs : filet de sécurité du finally.)
                 aff, hard = self._affinity_backup
                 state.ha_affinity.clear()
                 state.ha_affinity.update({k: set(v)
@@ -6534,11 +6723,15 @@ class Updater:
                 state.ha_affinity_hard.update({k: set(v)
                                                for k, v in hard.items()})
                 self._affinity_backup = None
-            self.log.info(f"{len(reenabled)} règle(s) node-affinity "
-                          f"réactivée(s) — le placement redevient contraint "
-                          f"par les règles ; le CRM applique ses préférences "
-                          f"aux prochains placements (failback possible : "
-                          f"ATTENDU, pas une anomalie).")
+            self.log.info(
+                f"{len(reenabled)} règle(s) node-affinity réactivée(s) "
+                f"(v24 : APRÈS le rapatriement/rééquilibrage) — le "
+                f"placement redevient contraint par les règles, le "
+                f"script n'a plus AUCUNE migration en cours : plus de "
+                f"course possible avec le CRM. Un failback résiduel "
+                f"(ressources restées hors règle après repli) est "
+                f"couvert par la fenêtre de stabilité CRM : ATTENDU, "
+                f"pas une anomalie.")
             if self.dry:
                 # ne retirer DU FICHIER que les règles réellement
                 # réactivées — une section d'un run --execute interrompu
@@ -7044,16 +7237,20 @@ class Updater:
                 self.log.info(f"[SIMULATION] 2g) Sortie de maintenance de "
                               f"{node} — aucune ressource HA n'a été "
                               f"détachée sur ce nœud, rien à réactiver.")
-            # 2g-bis simulé : règles node-affinity — réactivation à la
-            # sortie de maintenance seulement en mode --node ; en run
-            # complet elles restent désactivées jusqu'à la fin de
-            # l'Étape 1 (miroir du mode réel).
+            # 2g-bis simulé : règles node-affinity — la réactivation
+            # cluster est DIFFÉRÉE (v24) après le rapatriement/
+            # rééquilibrage, dans run() (miroir du mode réel) ; le
+            # modèle interne seul revient à la fin de l'Étape 1.
             if self.only_node:
-                self._ha_rules_restore_all(state)
+                self.log.info(f"[SIMULATION] 2g) {node}: règles "
+                              f"node-affinity — réactivation cluster "
+                              f"DIFFÉRÉE après le rapatriement (v24), "
+                              f"modèle interne seul restauré en fin "
+                              f"d'Étape 1.")
             elif self.ha_rules_snapshot:
                 self.log.info(f"[SIMULATION] 2g) {node}: règles "
                               f"node-affinity maintenues désactivées "
-                              f"(réactivation à la fin de l'Étape 1).")
+                              f"(réactivation APRÈS le rééquilibrage, v24).")
             src.in_maintenance = False
             src.status = "online"
             return
@@ -7127,9 +7324,9 @@ class Updater:
         # 2b-bis) désactivation de TOUTES les règles node-affinity du
         # cluster (une seule fois par run) : le planning (2c) et le CRM
         # sont LIBRES de toute préférence/contrainte node-affinity
-        # pendant TOUTE l'Étape 1 — réactivation à la fin de l'Étape 1,
-        # avant le rapatriement/rééquilibrage (run complet) ou à la
-        # sortie de maintenance du nœud (mode --node).
+        # pendant TOUTE l'Étape 1 — réactivation cluster en FIN de
+        # run, APRÈS le rapatriement/rééquilibrage, une seule fois
+        # (v24 : jamais pendant que le script migre).
         self._ha_rules_disable_all(state)
 
         try:
@@ -7319,16 +7516,22 @@ class Updater:
                 self._state_write()
             src.in_maintenance = False
             src.status = "online"
-            # 2g-bis) règles node-affinity : en mode --node, la fin
-            # d'Étape 1 EST la sortie de maintenance de CE nœud →
-            # réactivation AVANT la réactivation des ressources HA
-            # (le CRM applique la préférence dès la réactivation :
-            # failback ATTENDU, pas une anomalie). En run complet,
-            # elles restent désactivées jusqu'à la fin de l'Étape 1
-            # (sinon le CRM re-déciderait des relocate à CHAQUE sortie
-            # de maintenance, en pleine évacuation du nœud suivant).
+            # 2g-bis) règles node-affinity : en mode --node comme en run
+            # complet, la réactivation CLUSTER est DIFFÉRÉE (v24) —
+            # elle a lieu dans run() APRÈS le rapatriement/rééquilibrage
+            # des VMs évacuées (juste avant la fenêtre de stabilité CRM
+            # finale). Vécu 23/11 : réactivées plus tôt, elles donnaient
+            # au CRM une fenêtre pour lancer son failback EN COURS de
+            # nos migrations (verrou « migrate », FATAL au POST). Le
+            # modèle interne seul est restauré en fin d'Étape 1 (run) :
+            # le planning reste contraint, le cluster reste libre.
             if self.only_node:
-                self._ha_rules_restore_all(state)
+                self.log.info(
+                    f"{node}: règles node-affinity — réactivation "
+                    f"cluster DIFFÉRÉE après le rapatriement des VMs "
+                    f"évacuées (v24) : le failback CRM éventuel n'aura "
+                    f"lieu qu'une fois le script immobile, sous la "
+                    f"fenêtre de stabilité finale.")
             elif self.ha_rules_snapshot:
                 self.log.info(f"{node}: règles node-affinity maintenues "
                               f"désactivées (fin de l'Étape 1) — pas de "
@@ -8340,19 +8543,35 @@ class Updater:
                     f"{', '.join(self.minor_skipped)}. Les MAJ de ces nœuds "
                     f"restent en attente : relancez un run SANS l'option "
                     f"pour les appliquer.")
-            # FIN de l'Étape 1 : réactivation des règles node-affinity
-            # désactivées au premier nœud — AVANT le rapatriement
-            # (--node) / le rééquilibrage et le plan de failback des
-            # hors-règle, qui redeviennent contraints par les règles
-            # (dégel final cohérent : le CRM n'a pas de vague de
-            # relocate à corriger en pleine Étape 2).
-            self._ha_rules_restore_all(self.state)
+            # FIN de l'Étape 1 (v24) : le MODÈLE INTERNE des règles
+            # node-affinity est restauré ICI (le planning du rapatriement
+            # (--node) et du rééquilibrage reste contraint par les règles),
+            # mais la RÉACTIVATION CLUSTER est DIFFÉRÉE à la fin de
+            # TOUTES les migrations. Vécu 23/11/2026 : réactiver les
+            # règles AVANT le rapatriement donnait au CRM une fenêtre
+            # pour lancer son PROPRE failback (VM 501, ~153 Go : verrou
+            # « migrate », 500 au POST) PENDANT le rapatriement — nos
+            # migrations se heurtaient à son verrou et le run finissait
+            # en FATAL alors que le CRM plaçait la VM sur le même nœud
+            # que notre plan. Ordre v24 : gel CRM → migrations pilotées
+            # (rapatriement + rééquilibrage + secondes passes) → dégel
+            # → réactivation des règles → fenêtre de stabilité CRM : le
+            # failback CRM éventuel ne peut plus courir CONTRE le
+            # script, il se produit sous la fenêtre finale.
+            self._ha_rules_restore_all(self.state, cluster=False)
             # Rééquilibrage global uniquement en run complet : avec --node,
             # on rapatrie à la place les VMs évacuées vers leur nœud d'origine.
             if only_node:
                 self.restore_vms(nodes[0])
             else:
                 self.rebalance()
+            # v24 : TOUTES les migrations du script sont finies (dégel CRM
+            # inclus, tout mode confondu) → réactivation RÉELLE des règles
+            # node-affinity côté cluster. Le rapatriement a déjà remis les
+            # hors-règle sur leurs nœuds de règle : le CRM n'a presque rien
+            # à relocaliser, et tout failback résiduel tombe sous la
+            # fenêtre de stabilité CRM qui suit (wait_ha_settled).
+            self._ha_rules_restore_all(self.state, cluster=True)
             if not self.dry:
                 # attendre que le CRM ait fini TOUTES ses tâches HA
                 # (failback, fin de migration...) et rafraîchir l'état :
