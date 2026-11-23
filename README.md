@@ -345,7 +345,6 @@ python3 proxmox_rolling_update.py --execute --skip-minor-updates
 python3 proxmox_rolling_update.py --execute \
     --env-file ./proxmox.env.mycluster \
     --log-file ./run-$(date +%F).log -v
-```
 
 Le fichier env est **obligatoire** (`--env-file`, défaut
 `/etc/proxmox-updater/proxmox.env`) : sans lui le script s'arrête.
@@ -501,6 +500,57 @@ fin de fichier), et la comparaison avant/après écriture est normalisée
   (battements en log), **localise** le guest (la tâche extérieure l'a
   peut-être déjà placé sur la cible : succès sans rien migrer) puis
   retente depuis son nœud réel.
+- **Labels HA 100 % ASCII (v25)** : vécu 23/11/2026 (run 11:44) : dans
+  le panneau HA du GUI, les commentaires des ressources dont le
+  comment d'origine n'était PAS vide affichaient des caractères
+  bizarres exactement à la position du séparateur « — » (em dash,
+  U+2014, octets E2 80 94) que le script insérait entre le comment
+  d'origine et son label, alors que les commentaires d'origine vide
+  (composition 100 % ASCII) restaient sains : toute couche qui décode
+  ces octets comme du latin-1 produit les suites « â€ » vues. Proxmox
+  a un bug officiel du même acabit (double décodage du champ comment
+  des règles HA, pve-ha-manager 9.0, patch « rules: fix utf-8
+  encoding and decoding for comments field », octobre 2025) : le
+  champ comment est fragile sur les encodages. Le séparateur des
+  compositions (Étape 1 et gel CRM) devient un tiret ASCII « - » :
+  une composition partant d'un comment d'origine ASCII est
+  désormais garantie 100 % ASCII. AUCUN impact fonctionnel : le
+  comment est une pure traçabilité restaurée verbatim au dégel et à
+  la réactivation (snapshot lu AVANT composition), le CRM/LRM ne
+  l'interprètent pas.
+- **Séparateur « || » (v26)** : le tiret ASCII « - » de la v25
+  prêtait à confusion (les FQDN des comments d'origine et la date
+  du run contiennent naturellement des tirets : une ligne
+  « v-part01.u-bordeaux.fr - [label] (run 2026-11-23 11:44) » se
+  lisait mal). Le séparateur des compositions (Étape 1 et gel CRM)
+  devient un **double pipe « || »** : 100 % ASCII (l'immunité
+  d'encodage de la v25 est conservée) et sans sémantique dans les
+  fichiers de config PVE/pmxcfs, contrairement à « # », marqueur de
+  ligne de commentaire — un pipe n'est jamais réinterprété. La
+  composition devient « origine || [proxmox-rolling-update] gel CRM
+  temporaire (run …) ». Rien d'autre ne change (restauration
+  verbatim, aucun impact fonctionnel).
+- **Rééquilibrage PAS À PAS avec re-mesure réelle (v27)** : vécu
+  23/11/2026 : deux relances successives refaisaient chacune UNE
+  seule migration, l'écart réel mesuré en fin de run (19 %)
+  remontant ensuite (22 %) sans qu'aucune VM ne bouge : la pression
+  RAM est une **jauge réelle qui dérive** (page cache invité,
+  ballooning, KSM), alors que le plan simulait ses étapes sur des
+  prédictions (Σ RAM max déclarée) : « aucune étape supplémentaire
+  ne gagne » dans le modèle ne disait rien de la réalité. En mode
+  `--execute`, le plan du rééquilibrage final s'exécute désormais
+  **pas à pas** : UNE migration, **re-mesure réelle** du cluster
+  (fetch complet), **re-planification sur cette mesure** (le reste
+  du plan modèle est jeté et recalculé), jusqu'à convergence
+  mesurée (mêmes seuils : optimum théorique approché + 1 point,
+  gain ≥ 1 point par étape) ; l'anti ping-pong est conservé d'un
+  re-plan à l'autre (VMs déjà migrées exclues) ; les contraintes
+  d'affinité sont **ré-injectées** dans chaque état re-mesuré (les
+  règles étant en sommeil pendant le run, un fetch à ce stade ne
+  les voit pas : sans ré-injection, le re-plan pourrait cibler un
+  nœud interdit, que le CRM re-migrerait au dégel) ; cap
+  `PVE_REBALANCE_LIVE_MAX` (défaut 8) ; `PVE_REBALANCE_BATCH=1`
+  conserve l'ancien mode groupé ; dry-run inchangé.
 - **VMs arrêtées : laissées sur place** (aucune migration) — une VM éteinte
   ne court aucun risque pendant l'upgrade et le reboot ; sa ressource HA
   reste détachée puis réactivée dans son état d'origine (`stopped`), sans

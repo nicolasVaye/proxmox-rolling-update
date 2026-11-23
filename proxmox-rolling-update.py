@@ -166,6 +166,28 @@ devient « origine || [proxmox-rolling-update] gel CRM temporaire
 (run …) ». Rien d'autre ne change : restauration verbatim du
 comment d'origine (3 endroits), aucun impact fonctionnel.
 
+Rééquilibrage PAS À PAS avec re-mesure réelle (v27) : vécu 23/11/2026
+(soir) : deux relances successives du script refaisaient chacune UNE
+seule migration de rééquilibrage, l'écart réel mesuré en fin de run
+(19 %) remontant entre-temps (22 %) sans qu'aucune VM ne bouge : la
+pression RAM est une JAUGE RÉELLE qui dérive (page cache invité qui
+regonfle, ballooning, KSM qui fusionne les pages côté cible), alors
+que le plan simulait ses étapes sur des prédictions de charges
+(Σ RAM max déclarée des guests) : l'écart du modèle et l'écart réel
+divergent, et « aucune étape supplémentaire ne gagne » dans le
+MODÈLE ne dit rien de la réalité. En mode EXECUTE, le plan du
+rééquilibrage final s'exécute désormais PAS À PAS : UNE migration,
+RE-MESURE réelle du cluster (fetch complet), RE-PLANIFICATION sur
+cette mesure (le reste du plan modèle est JETÉ et recalculé sur la
+réalité), et ce jusqu'à convergence MESURÉE, avec les mêmes seuils
+qu'avant (optimum théorique approché + 1 point, gain >= 1 point par
+étape, aucune cible valide) ; l'anti ping-pong est conservé au
+travers des re-plans (les VMs déjà migrées sont exclues des plans
+suivants) ; cap d'étapes PVE_REBALANCE_LIVE_MAX (défaut 8) ;
+PVE_REBALANCE_BATCH=1 conserve l'ancien mode groupé (plan modèle
+exécuté en bloc) ; dry-run INCHANGÉ (rien ne migre réellement en
+simulation, il n'y a rien à re-mesurer).
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
@@ -179,7 +201,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "26"
+SCRIPT_VERSION = "27"
 
 import argparse
 import base64
@@ -1974,7 +1996,9 @@ def plan_off_rule_failback(state: ClusterState, logger: logging.Logger,
     return plans
 
 
-def plan_rebalance(state: ClusterState, logger: logging.Logger) -> List[Dict]:
+def plan_rebalance(state: ClusterState, logger: logging.Logger,
+                   quiet: bool = False,
+                   moved_init: Optional[Set[int]] = None) -> List[Dict]:
     """Étape 4 : rééquilibre équitable sur l'ensemble du cluster.
     Déplace les VMs tant que l'écart de pression RAM dépasse
     REBALANCE_THRESHOLD. La phase 2 n'évalue PAS seulement le couple
@@ -1997,7 +2021,11 @@ def plan_rebalance(state: ClusterState, logger: logging.Logger) -> List[Dict]:
     """
     REBALANCE_THRESHOLD = None      # AUTO : fixé après calcul de l'optimum
     plans: List[Dict] = []
-    moved = set()                # vmids déjà déplacés (anti ping-pong)
+    moved: Set[int] = set(moved_init) if moved_init else set()
+    # vmids déjà déplacés (anti ping-pong) — Y COMPRIS ceux des
+    # re-plans de raffinement v27 (moved_init transmis par la boucle
+    # d'exécution pas à pas : une VM migrée en étape 1 ne peut pas
+    # être re-déplacée par un re-plan de l'étape 2).
 
     # Une VM HA réactivée PEUT être déplacée ici (migration live supportée
     # par le CRM), MAIS uniquement vers un nœud autorisé par sa règle
@@ -2030,16 +2058,35 @@ def plan_rebalance(state: ClusterState, logger: logging.Logger) -> List[Dict]:
         gb_txt = (f" | écart global : {last_gap:.0%} ➔ {gap_after:.0%}"
                   if last_gap is not None
                   else f" | écart global : {gap_after:.0%}")
-        print_occupancy_table(
-            logger, state,
-            f"RÉÉQUILIBRAGE — ÉTAPE {step} : VM {vm.vmid} ({vm.name}) : "
-            f"{src.name} ➔ {tgt.name} "
-            f"(pression {src.name}: {sb:.0%} ➔ {sa:.0%} | "
-            f"{tgt.name}: {tb:.0%} ➔ {ta:.0%}){gb_txt}",
-            plans=[{"vm": vm, "from": src.name, "to": tgt.name}])
+        step_txt = (f"RÉÉQUILIBRAGE — ÉTAPE {step} : VM {vm.vmid} "
+                    f"({vm.name}) : "
+                    f"{src.name} ➔ {tgt.name} "
+                    f"(pression {src.name}: {sb:.0%} ➔ {sa:.0%} | "
+                    f"{tgt.name}: {tb:.0%} ➔ {ta:.0%}){gb_txt}")
+        if quiet:
+            # v27 re-plan : une ligne compacte, pas l'arborescence
+            # complète (déjà affichée par le plan initial).
+            logger.info(f"[rebalance] v27) Prochaine étape (re-plan réel) "
+                        f": VM {vm.vmid} ({vm.name}) : "
+                        f"{src.name} ➔ {tgt.name} "
+                        f"(pression {src.name}: {sb:.0%} ➔ {sa:.0%} | "
+                        f"{tgt.name}: {tb:.0%} ➔ {ta:.0%}){gb_txt}")
+        else:
+            print_occupancy_table(
+                logger, state, step_txt,
+                plans=[{"vm": vm, "from": src.name, "to": tgt.name}])
         last_gap = gap_after
 
-    print_occupancy_table(logger, state, "RÉÉQUILIBRAGE — ÉTAT DE DÉPART")
+    if quiet:
+        # v27 (re-plan de raffinement) : pas de rappel arborescent
+        # complet — le tableau de départ a déjà été affiché par le plan
+        # initial du run ; on ne rabâche pas les 13 nœuds à chaque
+        # re-mesure, la ligne « Écart de pression RAM global » ci-dessus
+        # (sur l'état RÉELLEMENT mesuré qui nous a été passé) suffit.
+        logger.info("[rebalance] v27) Re-plan calé sur l'état réellement "
+                    "MESURÉ après l'étape précédente :")
+    else:
+        print_occupancy_table(logger, state, "RÉÉQUILIBRAGE — ÉTAT DE DÉPART")
 
     def _online():
         return [n for n in state.nodes.values()
@@ -7991,8 +8038,117 @@ class Updater:
                             self.off_rule_vmids.discard(p["vm"].vmid)
                             self.off_rule_returned.add(p["vm"].vmid)
                     if plans:
-                        self._apply_migrations(plans, self.state,
-                                               ha_live=True)
+                        # v27 : MESURE RÉELLE après CHAQUE étape. L'ancien
+                        # mode exécutait le plan modèle EN BLOC : chaque
+                        # étape simulée partait de pressions PRÉDITES
+                        # (Σ RAM max déclarée), alors que les pressions
+                        # réelles dérivent (page cache invité qui regonfle,
+                        # ballooning, KSM...) — vécu 23/11 : l'écart réel
+                        # pouvait remonter entre deux runs sans qu'AUCUNE
+                        # migration supplémentaire ne soit "gagnante" dans
+                        # le modèle. Désormais : UNE migration, RE-MESURE
+                        # réelle (fetch complet du cluster), puis
+                        # RE-PLANIFICATION sur cette mesure — le plan
+                        # modèle restant est JETÉ et recalculé sur la
+                        # réalité. Mêmes seuils qu'avant (optimum + 1
+                        # point, gain >= 1 point par étape).
+                        if str(_env("PVE_REBALANCE_BATCH", "0")) == "1":
+                            self.log.info(
+                                "[rebalance] v27) Mode groupé conservé "
+                                "(PVE_REBALANCE_BATCH=1) : plan modèle "
+                                "exécuté en bloc.")
+                            self._apply_migrations(plans, self.state,
+                                                   ha_live=True)
+                        else:
+                            self.log.info(
+                                "[rebalance] v27) Exécution PAS À PAS : "
+                                "seule la PREMIÈRE étape du plan modèle "
+                                "ci-dessus part maintenant ; après CHAQUE "
+                                "migration le cluster est RE-MESURÉ (RAM "
+                                "réelle) et la suite du plan est "
+                                "recalculée sur cette mesure — plus "
+                                "d'exécution en bloc sur des prédictions "
+                                "qui dérivent de la réalité.")
+                            steps_max = max(1, int(_env(
+                                "PVE_REBALANCE_LIVE_MAX", "8")))
+                            moved_all: Set[int] = set()
+                            step_done = 0
+                            while plans and step_done < steps_max:
+                                p0 = plans[0]
+                                self._apply_migrations([p0], self.state,
+                                                       ha_live=True)
+                                step_done += 1
+                                moved_all.add(p0["vm"].vmid)
+                                # re-mesure RÉELLE : les pressions du plan
+                                # étaient des prédictions maxmem ; on
+                                # repart de la mesure du cluster.
+                                try:
+                                    fresh = self.client.fetch_state()
+                                except Exception as e:
+                                    self.log.warning(
+                                        f"[rebalance] v27) Re-mesure "
+                                        f"impossible ({e}) : arrêt du "
+                                        f"raffinement ici — l'état du "
+                                        f"cluster reste cohérent, "
+                                        f"relancer le script pour "
+                                        f"terminer.")
+                                    break
+                                self.state = fresh
+                                # v27 CRITIQUE : les règles node-affinity
+                                # sont encore en SOMMEIL côté cluster à ce
+                                # stade (disable/delete : elles ne sont
+                                # réactivées qu'après TOUTES les migrations,
+                                # en fin de run) — un fetch fait MAINTENANT
+                                # ne les voit pas et reconstruit un état
+                                # SANS contraintes d'affinité : les
+                                # re-plans pourraient cibler un nœud
+                                # INTERDIT par une règle, et le CRM
+                                # re-migrerait la VM au dégel (churn).
+                                # On ré-injecte donc le modèle d'affinité
+                                # COMPLET du run dans l'état re-mesuré
+                                # avant de re-planifier.
+                                fresh.ha_vmids = self.state.ha_vmids
+                                fresh.ha_affinity = self.state.ha_affinity
+                                fresh.ha_affinity_hard = \
+                                    self.state.ha_affinity_hard
+                                fresh.ha_together = self.state.ha_together
+                                fresh.ha_separate = self.state.ha_separate
+                                fresh.ha_separate_hard = \
+                                    self.state.ha_separate_hard
+                                fresh.ha_rules_info = \
+                                    self.state.ha_rules_info
+                                gap_real = pressure_gap(fresh)
+                                self.log.info(
+                                    f"[rebalance] v27) Étape {step_done} "
+                                    f"effectuée — re-mesure RÉELLE : "
+                                    + ("écart de pression illisible "
+                                       "(< 2 nœuds)"
+                                       if gap_real is None else
+                                       f"écart de pression actuel : "
+                                       f"{gap_real:.0%}")
+                                    + " — recalcul du plan sur cette "
+                                      "mesure…")
+                                sim = fresh.clone()
+                                plans = plan_rebalance(
+                                    sim, self.log, quiet=True,
+                                    moved_init=moved_all)
+                                self.state.theoretical_gap = \
+                                    sim.theoretical_gap
+                                if not plans:
+                                    self.log.info(
+                                        "[rebalance] v27) CONVERGENCE : "
+                                        "la mesure réelle ne justifie "
+                                        "plus AUCUNE étape de plus "
+                                        "(seuil/optimum atteint, gain < 1 "
+                                        "point, ou aucune cible valide) ✔")
+                            if plans and step_done >= steps_max:
+                                self.log.warning(
+                                    f"[rebalance] v27) Cap d'étapes "
+                                    f"atteint ({step_done} exécutée(s), "
+                                    f"PVE_REBALANCE_LIVE_MAX="
+                                    f"{steps_max}) — l'écart réel peut "
+                                    f"encore être au-dessus de la cible : "
+                                    f"relancer le script pour continuer.")
                     # SECONDE PASSE de rapatriement (post-rééquilibrage,
                     # même fenêtre de gel, cf. branche dry) : le
                     # rééquilibrage peut avoir LIBÉRÉ le nœud de règle
