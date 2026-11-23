@@ -129,6 +129,43 @@ DÉJÀ sur la cible, succès sans rien migrer) puis retente depuis son
 nœud réel ; (3) même en cas d'échec résiduel, le déroulé loggué
 distingue maintenant la course CRM d'une vraie panne.
 
+Labels HA 100 % ASCII (v25) : vécu 23/11/2026 11:44 (run en cours) :
+dans le panneau HA du GUI, les commentaires des ressources dont le
+comment d'origine n'était PAS vide affichaient des caractères bizarres
+exactement à la position du séparateur « — » que le script insérait
+entre le comment d'origine et son label de traçabilité, alors que les
+commentaires d'origine vide (composition 100 % ASCII) restaient
+sains. Ce tiret cadratin (em dash, U+2014, octets E2 80 94) était le
+SEUL caractère non-ASCII de la composition : toute couche qui
+décode ces octets comme du latin-1 produit les suites « â€ »
+typiquement vues. Proxmox a d'ailleurs un bug officiel de DOUBLE
+décodage du champ comment des règles HA (pve-ha-manager 9.0,
+patch « rules: fix utf-8 encoding and decoding for comments field »,
+octobre 2025) : le champ comment est fragile sur les encodages,
+quelle que soit la couche exacte qui corrompt (écriture pmxcfs ou
+affichage). Correctifs : le séparateur des compositions de comment
+(Étape 1 et gel CRM) devient un tiret ASCII « - » ; le label et tout
+le texte du script restant inchangés par ailleurs, une composition à
+partir d'un comment d'origine ASCII est désormais garantie 100 %
+ASCII (immunisée contre tout mauvais décodage). AUCUN impact sur la
+fonction : le champ comment est une pure traçabilité jamais
+interprétée par le CRM/LRM, et le comment d'origine est restauré
+verbatim (snapshot lu AVANT composition) au dégel comme à la
+réactivation de l'Étape 1.
+
+Séparateur « || » (v26) : le tiret ASCII « - » de la v25 prêtait à
+confusion (les FQDN des comments d'origine et la date du run en
+contiennent naturellement : « v-part01.u-bordeaux.fr - [label]
+(run 2026-11-23 11:44) » se lisait mal). Le séparateur des
+compositions de comment (Étape 1 et gel CRM) devient un DOUBLE
+PIPE « || », 100 % ASCII (l'immunité d'encodage de la v25 est
+conservée) et SANS aucune sémantique dans les fichiers de config
+PVE/pmxcfs : contrairement à « # », marqueur de ligne de
+commentaire, un pipe n'est jamais réinterprété. La composition
+devient « origine || [proxmox-rolling-update] gel CRM temporaire
+(run …) ». Rien d'autre ne change : restauration verbatim du
+comment d'origine (3 endroits), aucun impact fonctionnel.
+
 Usage :
     python3 proxmox_rolling_update.py --dry-run
     python3 proxmox_rolling_update.py --execute
@@ -142,7 +179,7 @@ Usage :
 # (des copies périmées ont déjà été prises pour des versions à jour). À
 # incrémenter à CHAQUE publication.
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "24"
+SCRIPT_VERSION = "26"
 
 import argparse
 import base64
@@ -7299,7 +7336,7 @@ class Updater:
                         f"état d'origine préservé ✔")
                     continue
                 orig = self.client.ha_resource_snapshot(sid)
-                lbl = (f"{orig['comment']} — " if orig["comment"] else "")
+                lbl = (f"{orig['comment']} || " if orig["comment"] else "")
                 self.client.ha_set_resource(
                     sid, "ignored",
                     comment=f"{lbl}{PRU_LABEL} ignored temporaire "
@@ -7708,7 +7745,7 @@ class Updater:
             if sid in self.ha_snapshot:
                 continue          # déjà mémorisée (reprise de run interrompu)
             orig = self.client.ha_resource_snapshot(sid)
-            lbl = (f"{orig['comment']} — " if orig["comment"] else "")
+            lbl = (f"{orig['comment']} || " if orig["comment"] else "")
             self.client.ha_set_resource(
                 sid, "ignored",
                 comment=f"{lbl}{PRU_LABEL} gel CRM temporaire (run {ts})")
